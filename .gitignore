@@ -1,0 +1,27 @@
+# Secrets
+config.json
+
+# Output
+output/
+
+# Temp
+tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
