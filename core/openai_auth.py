@@ -23,7 +23,7 @@ from curl_cffi import requests as cffi_requests
 
 from .email_gen import random_birthdate, random_display_name
 from .otp import fetch_otp
-from .sentinel import build_sentinel_pow_token, SENTINEL_URL
+from .sentinel import SENTINEL_URL, build_sentinel_pow_token
 
 logger = logging.getLogger(__name__)
 
@@ -155,36 +155,44 @@ def _build_oauth_url(client_id, redirect_uri, code_challenge, state):
 def _get_sentinel(session, did, flow):
     """Call sentinel API -> return (sentinel_token, sentinel_header_json).
 
-    Uses a standalone request (not through the session) with empty PoW
-    to match the reference implementation.
+    Computes a real PoW token via SHA3-512 brute force and submits it
+    through the active session so cookies/TLS fingerprint stay consistent.
+    Empty PoW was rejected by the server and caused 400 errors on later
+    steps (e.g. password /user/register).
     """
-    proxy = None
-    if hasattr(session, 'proxies') and session.proxies:
-        proxy = session.proxies.get("https") or session.proxies.get("http")
+    ua = session.headers.get("user-agent") or session.headers.get("User-Agent") \
+        or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    sentinel_body = json.dumps({"p": "", "id": did, "flow": flow})
     try:
-        resp = cffi_requests.post(
+        pow_token = build_sentinel_pow_token(ua)
+    except Exception as e:
+        logger.warning("Sentinel PoW solve failed: %s", e)
+        return None, None
+
+    sentinel_body = json.dumps(
+        {"p": pow_token, "id": did, "flow": flow},
+        separators=(",", ":"),
+    )
+    try:
+        resp = session.post(
             SENTINEL_URL,
             data=sentinel_body,
             headers={
-                "origin": "https://sentinel.openai.com",
-                "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-                "content-type": "text/plain;charset=UTF-8",
-                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Origin": "https://sentinel.openai.com",
+                "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
+                "Content-Type": "text/plain;charset=UTF-8",
             },
-            impersonate="chrome120",
-            proxies={"https": proxy, "http": proxy} if proxy else None,
-            timeout=15,
+            timeout=30,
         )
         if resp.status_code == 200:
-            token = resp.json().get("token")
+            token = (resp.json() or {}).get("token")
             if token:
-                header = json.dumps({"p": "", "t": "", "c": token, "id": did, "flow": flow})
+                header = json.dumps(
+                    {"p": "", "t": "", "c": token, "id": did, "flow": flow}
+                )
                 return token, header
-            else:
-                logger.warning("Sentinel API returned no token: %s", resp.text[:200])
+            logger.warning("Sentinel API returned no token: %s", resp.text[:200])
         else:
             logger.warning("Sentinel API returned %d: %s", resp.status_code, resp.text[:200])
     except Exception as e:
@@ -326,14 +334,16 @@ def register_account(
             logger.info("[register] %s - account already exists, OTP auto-sent", email)
         else:
             # 5) Set password
+            # NOTE: do NOT attach openai-sentinel-token on /user/register.
+            # Session cookies from the previous sentinel-verified call carry
+            # the anti-bot check forward; re-sending the header here triggers
+            # 400 (reference impl matches this).
             logger.info("[register] %s - setting password", email)
             pwd_hdrs = {
                 "Referer": f"{AUTH_BASE}/create-account/password",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             }
-            if sentinel_header:
-                pwd_hdrs["openai-sentinel-token"] = sentinel_header
             r = session.post(REGISTER_URL, headers=pwd_hdrs,
                              data=json.dumps({"password": password, "username": email}),
                              timeout=30)
@@ -343,7 +353,15 @@ def register_account(
 
             # 6) Send OTP
             logger.info("[register] %s - sending OTP", email)
-            session.post(SEND_OTP_URL, headers=hdrs, timeout=30)
+            r = session.post(SEND_OTP_URL,
+                             headers={"Referer": f"{AUTH_BASE}/create-account/password",
+                                      "Content-Type": "application/json",
+                                      "Accept": "application/json"},
+                             timeout=30)
+            if r.status_code != 200:
+                return {"ok": False,
+                        "error": f"send_otp_{r.status_code}: {r.text[:300]}"}
+            logger.info("[register] %s - send_otp OK: %s", email, r.text[:200])
 
         # 7) Fetch + validate OTP
         domain = email.split("@")[1]

@@ -184,12 +184,19 @@ def get_chatgpt_session_at(
         logger.info("[chatgpt] %s - solving sentinel", email)
         _, sentinel_header = _get_sentinel(session, did, "authorize_continue")
 
-        # ── Pre-fetch stale OTP ──
+        # ── Note existing OTP (but don't pre-skip it) ──
+        # OpenAI OTPs are valid for multi-use within TTL; and after validate,
+        # OpenAI throttles sending a new OTP to the same address for ~60s.
+        # So the "stale" OTP from the previous register-phase validate is
+        # often still valid and sometimes the ONLY code we'll see. We try it
+        # first; if validate fails (HTTP != 200) we'll add it to skip_codes
+        # and wait for a new one.
         domain = email.split("@")[1]
-        stale_otp = peek_otp(email, domain, otp_token)
-        skip_codes = {stale_otp} if stale_otp else set()
-        if stale_otp:
-            logger.info("[chatgpt] %s - stale OTP: %s (will skip)", email, stale_otp)
+        existing_otp = peek_otp(email, domain, otp_token)
+        skip_codes: set = set()
+        if existing_otp:
+            logger.info("[chatgpt] %s - cached OTP present: %s (will try first)",
+                         email, existing_otp)
 
         # ── Step 4: Submit email ──
         logger.info("[chatgpt] %s - submitting email", email)
@@ -236,7 +243,10 @@ def get_chatgpt_session_at(
 
         # ── Step 6: OTP ──
         if page_type in ("email_otp_verification", "email_otp"):
-            # Email submission already triggered OTP — wait for it to arrive
+            # Email submission already triggered OTP — wait for it to arrive.
+            # NOTE: observed MX delivery latency on self-hosted domains is
+            # up to ~140s (aitech.email via residential proxy). Poll windows
+            # below must cover that or we'll miss fresh OTPs.
             otp_validated = False
             for otp_attempt in range(3):
                 # First attempt: just wait for the auto-sent OTP; later attempts: resend first
@@ -249,8 +259,9 @@ def get_chatgpt_session_at(
                             email, wait, otp_attempt + 1, skip_codes)
                 time.sleep(wait)
 
+                # ~180s window per fetch: enough for slow MX delivery paths
                 otp_code = fetch_otp(email, domain, otp_token,
-                                     max_retries=6, retry_interval=5,
+                                     max_retries=18, retry_interval=10,
                                      skip_codes=skip_codes)
                 if not otp_code:
                     if otp_attempt < 2:

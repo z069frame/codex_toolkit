@@ -17,7 +17,7 @@ import sys
 import datetime
 
 from core import load_config
-from core.api import CPAAdmin, CPAMgmt, DataManager, decode_jwt_claims
+from core.api import CPAAdmin, CPAMgmt, DataManager, decode_jwt_claims, check_deactivated
 from core.email_gen import generate_email
 from core.openai_auth import register_account, oauth_login
 from core.chatgpt_session import get_chatgpt_session_at
@@ -37,7 +37,9 @@ def setup_logging(verbose: bool = False):
 
 def cmd_register(cfg, args):
     count = args.count or 1
-    proxy = cfg.get("proxy")
+    proxy = (getattr(args, "proxy", None) or cfg.get("proxy")) or None
+    if getattr(args, "proxy", None):
+        print(f"🌐 proxy override: {args.proxy.split('@')[-1] if '@' in args.proxy else args.proxy}")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     client_id = cfg["oauth_client_id"]
@@ -46,13 +48,26 @@ def cmd_register(cfg, args):
     output_dir = os.path.join(os.path.dirname(__file__), cfg.get("output_dir", "output"))
     os.makedirs(output_dir, exist_ok=True)
 
+    # Explicit email overrides generation and clamps count to 1
+    fixed_email = (args.email or "").strip() or None
+    if fixed_email:
+        if count != 1:
+            print(f"⚠️  --email provided, forcing count=1 (was {count})")
+        count = 1
+
+    # Explicit domain: auto-generate prefix on that domain (ignored if --email set)
+    fixed_domain = (args.domain or "").strip().lstrip("@") or None
+    if fixed_domain and fixed_email:
+        print(f"⚠️  --domain ignored because --email is set")
+        fixed_domain = None
+
     # Init API clients
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
     cpa_mgmt = CPAMgmt(cfg["cpa_mgmt_base"], cfg["cpa_mgmt_bearer"])
 
     results = []
     for i in range(count):
-        email = generate_email(domains)
+        email = fixed_email or generate_email(domains, domain=fixed_domain)
         print(f"\n{'='*60}")
         print(f"[{i+1}/{count}] Registering {email}")
         print(f"{'='*60}")
@@ -201,7 +216,9 @@ def _do_cpa_mgmt_oauth(cpa_mgmt: CPAMgmt, email: str, password: str,
 
 
 def cmd_oauth(cfg, args):
-    proxy = cfg.get("proxy")
+    proxy = (getattr(args, "proxy", None) or cfg.get("proxy")) or None
+    if getattr(args, "proxy", None):
+        print(f"🌐 proxy override: {args.proxy.split('@')[-1]}")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
 
@@ -317,7 +334,9 @@ def cmd_oauth(cfg, args):
 
 
 def cmd_session(cfg, args):
-    proxy = cfg.get("proxy")
+    proxy = (getattr(args, "proxy", None) or cfg.get("proxy")) or None
+    if getattr(args, "proxy", None):
+        print(f"🌐 proxy override: {args.proxy.split('@')[-1]}")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     output_dir = os.path.join(os.path.dirname(__file__), cfg.get("output_dir", "output"))
@@ -400,7 +419,9 @@ def cmd_session(cfg, args):
 
 
 def cmd_dm_writeback(cfg, args):
-    proxy = cfg.get("proxy")
+    proxy = (getattr(args, "proxy", None) or cfg.get("proxy")) or None
+    if getattr(args, "proxy", None):
+        print(f"🌐 proxy override: {args.proxy.split('@')[-1]}")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     output_dir = os.path.join(os.path.dirname(__file__), cfg.get("output_dir", "output"))
@@ -531,7 +552,9 @@ def cmd_dm_writeback(cfg, args):
 
 
 def cmd_relogin(cfg, args):
-    proxy = cfg.get("proxy")
+    proxy = (getattr(args, "proxy", None) or cfg.get("proxy")) or None
+    if getattr(args, "proxy", None):
+        print(f"🌐 proxy override: {args.proxy.split('@')[-1]}")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     output_dir = os.path.join(os.path.dirname(__file__), cfg.get("output_dir", "output"))
@@ -655,6 +678,171 @@ def cmd_relogin(cfg, args):
 
 
 # ---------------------------------------------------------------------------
+#  oauth-free command — OAuth DM accounts into free CPA (cpa.lsai.uk)
+# ---------------------------------------------------------------------------
+
+
+def cmd_oauth_free(cfg, args):
+    proxy = (getattr(args, "proxy", None) or cfg.get("proxy")) or None
+    if getattr(args, "proxy", None):
+        print(f"🌐 proxy override: {args.proxy.split('@')[-1]}")
+    password = cfg["reg_password"]
+    otp_token = cfg["otp_token"]
+
+    cpa_mgmt = CPAMgmt(cfg["cpa_mgmt_base"], cfg["cpa_mgmt_bearer"])
+    dm = DataManager(cfg["dm_base"], cfg["dm_token"])
+
+    # ── Collect existing free CPA emails ──
+    print("Fetching free CPA auth files...")
+    cpa_files = cpa_mgmt.list_auth_files()
+    cpa_emails = set()
+    for f in cpa_files:
+        e = (f.get("email") or f.get("account") or "").lower()
+        if e:
+            cpa_emails.add(e)
+    print(f"  Free CPA has {len(cpa_emails)} existing auth files")
+
+    # ── Get DM accounts ──
+    if args.email:
+        acc = dm.find_account(args.email)
+        if not acc:
+            print(f"❌ Account not found in DM: {args.email}")
+            return
+        all_accounts = [acc]
+    else:
+        print("Fetching DM accounts...")
+        all_accounts = dm.list_accounts()
+        print(f"  DM has {len(all_accounts)} accounts total")
+
+    # ── Filter: category, not already in free CPA ──
+    cat_filter = args.category.lower() if args.category else None
+    pre_candidates = []
+    skipped_cat = 0
+    skipped_cpa = 0
+    for acc in all_accounts:
+        email = (acc.get("email") or "").lower()
+        cat = (acc.get("category") or "").strip().lower()
+        if cat_filter and cat != cat_filter:
+            skipped_cat += 1
+            continue
+        if email in cpa_emails:
+            skipped_cpa += 1
+            continue
+        pre_candidates.append(acc)
+
+    filters = []
+    if skipped_cat:
+        filters.append(f"{skipped_cat} category mismatch")
+    if skipped_cpa:
+        filters.append(f"{skipped_cpa} already in CPA")
+    print(f"  Pre-filter: {len(pre_candidates)} candidates"
+          + (f" (skipped {', '.join(filters)})" if filters else ""))
+
+    if not pre_candidates:
+        print("⏭️  No candidates to process")
+        return
+
+    # ── Check deactivated status ──
+    print(f"\nChecking deactivated status for {len(pre_candidates)} accounts...")
+    candidates = []
+    deactivated_count = 0
+    check_error_count = 0
+    for acc in pre_candidates:
+        email = acc.get("email", "")
+        result = check_deactivated(email, otp_token)
+        if result.get("error"):
+            # If check fails, include the account (fail-open)
+            check_error_count += 1
+            candidates.append(acc)
+        elif result.get("deactivated"):
+            deactivated_count += 1
+        else:
+            candidates.append(acc)
+
+    print(f"  Result: {len(candidates)} alive, {deactivated_count} deactivated"
+          + (f", {check_error_count} check errors (included)" if check_error_count else ""))
+
+    if not candidates:
+        print("⏭️  No non-deactivated candidates found")
+        return
+
+    # ── Apply count limit ──
+    candidates.sort(key=lambda x: (
+        0 if (x.get("status") or "").lower() == "error" else 1,
+        int(x.get("id") or 10**9),
+    ))
+    count = args.count
+    if count > 0:
+        candidates = candidates[:count]
+
+    print(f"\n🚀 Processing {len(candidates)} accounts for free CPA OAuth...\n")
+
+    # ── OAuth each candidate ──
+    results = []
+    for i, acc in enumerate(candidates):
+        email = acc.get("email", "")
+        acc_id = acc.get("id", "?")
+        category = acc.get("category", "?")
+        tc = acc.get("token_context", "?")
+
+        print(f"{'='*60}")
+        print(f"[{i+1}/{len(candidates)}] OAuth-Free: {email}")
+        print(f"  id={acc_id}  category={category}  token_context={tc}")
+        print(f"{'='*60}")
+
+        # Get OAuth URL from free CPA
+        url_resp = cpa_mgmt.get_oauth_url()
+        if not url_resp.get("ok"):
+            print(f"  ❌ get_oauth_url failed: {url_resp}")
+            results.append({"email": email, "ok": False, "error": f"get_oauth_url: {url_resp}"})
+            continue
+
+        oauth_url = url_resp.get("url")
+        cpa_state = url_resp.get("state")
+        if not oauth_url:
+            print(f"  ❌ No OAuth URL returned")
+            results.append({"email": email, "ok": False, "error": "no_oauth_url"})
+            continue
+
+        print(f"  → OAuth URL obtained, completing login...")
+
+        # Complete OAuth login
+        code, state, err = oauth_login(oauth_url, email, password, otp_token, proxy)
+        if not code:
+            print(f"  ❌ OAuth login failed: {err}")
+            results.append({"email": email, "ok": False, "error": f"oauth_login: {err}"})
+            continue
+
+        print(f"  ✅ OAuth login complete, sending callback...")
+
+        # Send callback to free CPA
+        cb_resp = cpa_mgmt.oauth_callback(state or cpa_state, code)
+        if not cb_resp.get("ok"):
+            print(f"  ❌ Callback failed: {cb_resp}")
+            results.append({"email": email, "ok": False, "error": f"callback: {cb_resp}"})
+            continue
+
+        print(f"  ✅ OAuth-Free complete for {email}")
+        results.append({
+            "email": email,
+            "ok": True,
+            "category": category,
+        })
+
+    # Summary
+    print(f"\n{'='*60}")
+    ok_count = sum(1 for r in results if r["ok"])
+    fail_count = len(results) - ok_count
+    print(f"OAuth-Free summary: {ok_count} succeeded, {fail_count} failed (of {len(results)} processed)")
+    for r in results:
+        status_icon = "✅" if r["ok"] else "❌"
+        if r["ok"]:
+            print(f"  {status_icon} {r['email']} ({r.get('category','?')})")
+        else:
+            print(f"  {status_icon} {r['email']} — {r.get('error', '')}")
+
+
+# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 
@@ -670,25 +858,39 @@ def main():
     # register
     p_reg = sub.add_parser("register", help="Register new ChatGPT accounts")
     p_reg.add_argument("--count", "-n", type=int, default=1, help="number of accounts")
+    p_reg.add_argument("--email", "-e", help="specific email to register (overrides random generation; forces count=1)")
+    p_reg.add_argument("--domain", "-d", help="specific domain to use (auto-generates prefix); overrides daily rotation")
+    p_reg.add_argument("--proxy", help="override config.json proxy for this run (e.g. http://user:pass@host:port)")
 
     # oauth
     p_oauth = sub.add_parser("oauth", help="OAuth for existing accounts (team→CPA-B)")
     p_oauth.add_argument("--email", "-e", help="specific email (skip candidate selection)")
     p_oauth.add_argument("--count", "-n", type=int, default=0, help="max candidates (0=all)")
+    p_oauth.add_argument("--proxy", help="override config.json proxy for this run")
 
     # session — full-permission ChatGPT AT
     p_session = sub.add_parser("session", help="Get full-permission ChatGPT session AT (for invite etc.)")
     p_session.add_argument("--email", "-e", help="email to login (default: latest registered)")
+    p_session.add_argument("--proxy", help="override config.json proxy for this run")
 
     # dm-writeback — get team session AT and write back to DM
     p_wb = sub.add_parser("dm-writeback", help="Get team session AT and write back to DM")
     p_wb.add_argument("--email", "-e", help="specific email (skip candidate selection)")
     p_wb.add_argument("--count", "-n", type=int, default=0, help="max candidates (0=all)")
+    p_wb.add_argument("--proxy", help="override config.json proxy for this run")
 
     # relogin — re-login unknown accounts to get free AT
     p_relogin = sub.add_parser("relogin", help="Re-login accounts with token_context=unknown to get free AT")
     p_relogin.add_argument("--email", "-e", help="specific email (skip candidate selection)")
     p_relogin.add_argument("--count", "-n", type=int, default=1, help="number of candidates to process")
+    p_relogin.add_argument("--proxy", help="override config.json proxy for this run")
+
+    # oauth-free — OAuth into free CPA for non-deactivated accounts
+    p_ofree = sub.add_parser("oauth-free", help="OAuth DM accounts into free CPA (non-deactivated only)")
+    p_ofree.add_argument("--email", "-e", help="specific email")
+    p_ofree.add_argument("--count", "-n", type=int, default=0, help="max candidates (0=all)")
+    p_ofree.add_argument("--category", help="filter by DM category (e.g. enterprise, business, unsubscribed)")
+    p_ofree.add_argument("--proxy", help="override config.json proxy for this run")
 
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -705,6 +907,8 @@ def main():
         cmd_dm_writeback(cfg, args)
     elif args.command == "relogin":
         cmd_relogin(cfg, args)
+    elif args.command == "oauth-free":
+        cmd_oauth_free(cfg, args)
     else:
         parser.print_help()
 

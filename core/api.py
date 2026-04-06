@@ -223,9 +223,10 @@ class DataManager:
         )
         return {"ok": ok, "status": st, **d}
 
-    def find_account(self, email: str) -> dict | None:
+    def find_account(self, email: str, include_disabled: bool = True) -> dict | None:
+        flag = "1" if include_disabled else "0"
         ok, st, d = _http(
-            f"{self.base}/admin/accounts?query={email}",
+            f"{self.base}/admin/accounts?query={email}&include_disabled={flag}",
             headers=self._headers(),
         )
         if not ok:
@@ -452,6 +453,28 @@ class DataManager:
             int(x.get("id") or 10**9),
         ))
         return candidates if count <= 0 else candidates[:count]
+
+
+# ---------------------------------------------------------------------------
+#  Deactivated Check (mail service)
+# ---------------------------------------------------------------------------
+
+def check_deactivated(email: str, otp_token: str) -> dict:
+    """
+    Check if an email has been deactivated by OpenAI.
+    Uses the mail service at m.{domain}/api/check-deactivated.
+    Returns {"deactivated": bool, "matched_count": int, ...}
+    """
+    domain = email.split("@", 1)[-1] if "@" in email else ""
+    if not domain:
+        return {"deactivated": False, "error": "invalid_email"}
+    url = f"https://m.{domain}/api/check-deactivated?email={email}"
+    headers = {"Authorization": f"Bearer {otp_token}"}
+    ok, st, d = _http(url, headers=headers)
+    if not ok:
+        logger.warning("check_deactivated failed for %s: status=%d %s", email, st, d)
+        return {"deactivated": False, "error": f"http_{st}"}
+    return d
 
 
 # ---------------------------------------------------------------------------

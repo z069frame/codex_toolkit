@@ -30,14 +30,19 @@ def get_today_domain(domains: list[str], tz_name: str = "Asia/Shanghai") -> str:
     return domains[day_index % len(domains)]
 
 
-def generate_email(domains: list[str], tz_name: str = "Asia/Shanghai") -> str:
-    """Generate a random email address using today's domain."""
-    domain = get_today_domain(domains, tz_name)
+def generate_email(domains: list[str], tz_name: str = "Asia/Shanghai",
+                   domain: str | None = None) -> str:
+    """Generate a random email address.
+
+    If `domain` is provided, use it directly; otherwise pick today's rotating
+    domain from the `domains` list.
+    """
+    picked = domain or get_today_domain(domains, tz_name)
     name = random.choice(FIRST_NAMES)
     today = datetime.date.today()
     date_part = today.strftime("%y%m%d")
     rand_part = f"{random.randint(0, 999):03d}"
-    return f"{name}{date_part}{rand_part}@{domain}"
+    return f"{name}{date_part}{rand_part}@{picked}"
 
 
 def random_display_name() -> str:
