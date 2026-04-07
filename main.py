@@ -148,7 +148,10 @@ def cmd_register(cfg, args):
             print(f"  ⚠️  DM verify: not found (non-fatal)")
 
         # Phase 3: OAuth via CPA (management API) for free token storage
-        if at and not phone_required:
+        # NOTE: try CPA OAuth regardless of phone_required — the CPA OAuth
+        # is a separate login flow that usually works even for accounts
+        # that hit add_phone during registration.
+        if at:
             print(f"  → Starting CPA OAuth (free token)...")
             oauth_result = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
             cpa_ok = oauth_result.get("ok", False)

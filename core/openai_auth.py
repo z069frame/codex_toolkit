@@ -361,7 +361,7 @@ def register_account(
             if r.status_code != 200:
                 return {"ok": False,
                         "error": f"send_otp_{r.status_code}: {r.text[:300]}"}
-            logger.info("[register] %s - send_otp OK: %s", email, r.text[:200])
+            logger.info("[register] %s - send_otp OK (HTTP 200)", email)
 
         # 7) Fetch + validate OTP
         domain = email.split("@")[1]
