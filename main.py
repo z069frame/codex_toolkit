@@ -20,7 +20,7 @@ from core import load_config
 from core.api import CPAAdmin, CPAMgmt, DataManager, decode_jwt_claims, check_deactivated
 from core.email_gen import generate_email
 from core.openai_auth import register_account, oauth_login
-from core.chatgpt_session import get_chatgpt_session_at
+from core.chatgpt_session import get_chatgpt_session_at, get_chatgpt_full_tokens
 
 LOG_FMT = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 
@@ -107,6 +107,36 @@ def cmd_register(cfg, args):
             else:
                 print(f"  ✅ Registered — AT length: {len(at)}, RT length: {len(rt)}")
 
+        # Phase 1.5: Get ChatGPT full tokens (AT + RT) via PKCE OAuth
+        chatgpt_at = ""
+        chatgpt_rt = ""
+        use_rt = getattr(args, "rt", False)
+        if use_rt:
+            print(f"  → Getting ChatGPT RT via full PKCE OAuth...")
+            rt_result = get_chatgpt_full_tokens(email, password, otp_token, proxy)
+            if rt_result["ok"]:
+                chatgpt_at = rt_result["access_token"]
+                chatgpt_rt = rt_result["refresh_token"]
+                print(f"  ✅ ChatGPT tokens: AT len={len(chatgpt_at)}, RT len={len(chatgpt_rt)}")
+                # Use ChatGPT AT for DM (better scopes) if we don't already have one
+                if not at:
+                    at = chatgpt_at
+                # Save ChatGPT tokens to separate file
+                rt_file = os.path.join(output_dir, f"{email}.chatgpt.json")
+                with open(rt_file, "w") as f:
+                    json.dump({
+                        "email": email,
+                        "access_token": chatgpt_at,
+                        "refresh_token": chatgpt_rt,
+                        "id_token": rt_result.get("id_token", ""),
+                        "expires_in": rt_result.get("expires_in"),
+                        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    }, f, indent=2)
+                print(f"  💾 ChatGPT tokens → {rt_file}")
+            else:
+                print(f"  ⚠️  ChatGPT RT failed: {rt_result['error']}")
+
         # Save credentials locally (always, even without tokens)
         token_file = os.path.join(output_dir, f"{email}.json")
         with open(token_file, "w") as f:
@@ -115,6 +145,7 @@ def cmd_register(cfg, args):
                 "password": password,
                 "access_token": at,
                 "refresh_token": rt,
+                "chatgpt_refresh_token": chatgpt_rt,
                 "phone_required": phone_required,
                 "created_at": datetime.datetime.utcnow().isoformat() + "Z",
             }, f, indent=2)
@@ -864,6 +895,7 @@ def main():
     p_reg.add_argument("--email", "-e", help="specific email to register (overrides random generation; forces count=1)")
     p_reg.add_argument("--domain", "-d", help="specific domain to use (auto-generates prefix); overrides daily rotation")
     p_reg.add_argument("--proxy", help="override config.json proxy for this run (e.g. http://user:pass@host:port)")
+    p_reg.add_argument("--rt", action="store_true", help="also get ChatGPT RT via full PKCE OAuth (saved to .chatgpt.json)")
 
     # oauth
     p_oauth = sub.add_parser("oauth", help="OAuth for existing accounts (team→CPA-B)")

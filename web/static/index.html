@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codex Toolkit</title>
+<style>
+  :root { --bg: #0f1117; --card: #1a1d27; --border: #2a2d3a; --primary: #6366f1;
+          --primary-hover: #818cf8; --green: #22c55e; --red: #ef4444; --yellow: #eab308;
+          --text: #e2e8f0; --text-dim: #94a3b8; --text-muted: #64748b; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--text); min-height: 100vh; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 10px; }
+  h1 span { color: var(--primary); }
+
+  /* Settings bar */
+  .settings-bar { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+                  padding: 12px 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .settings-bar label { font-size: 0.8rem; color: var(--text-dim); white-space: nowrap; }
+  .proxy-group { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 300px; }
+  .proxy-group input { flex: 1; min-width: 200px; }
+  .proxy-badge { font-size: 0.75rem; padding: 3px 8px; border-radius: 8px; white-space: nowrap; }
+  .proxy-badge-on { background: #14532d; color: #4ade80; }
+  .proxy-badge-off { background: #7f1d1d; color: #fca5a5; }
+  .proxy-badge-default { background: #1e3a5f; color: #60a5fa; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+  .tab { padding: 10px 18px; cursor: pointer; border-radius: 8px 8px 0 0; font-size: 0.9rem;
+         color: var(--text-dim); border: 1px solid transparent; border-bottom: none; transition: all 0.2s; }
+  .tab:hover { color: var(--text); background: var(--card); }
+  .tab.active { color: var(--primary); background: var(--card); border-color: var(--border); font-weight: 500; }
+
+  /* Panels */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Cards */
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  .card h3 { font-size: 1rem; margin-bottom: 12px; color: var(--text); }
+
+  /* Forms */
+  .form-row { display: flex; gap: 12px; margin-bottom: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-group label { font-size: 0.8rem; color: var(--text-dim); }
+  input, select { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+                  padding: 8px 12px; border-radius: 6px; font-size: 0.9rem; min-width: 180px; }
+  input:focus, select:focus { outline: none; border-color: var(--primary); }
+  input[type="number"] { min-width: 80px; }
+  input[type="checkbox"] { min-width: auto; width: 18px; height: 18px; accent-color: var(--primary); }
+
+  /* Buttons */
+  .btn { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem;
+         font-weight: 500; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
+  .btn-primary { background: var(--primary); color: white; }
+  .btn-primary:hover { background: var(--primary-hover); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-sm { padding: 5px 12px; font-size: 0.8rem; }
+  .btn-green { background: var(--green); color: white; }
+  .btn-green:hover { opacity: 0.9; }
+  .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text-dim); }
+  .btn-ghost:hover { border-color: var(--text-dim); color: var(--text); }
+
+  /* Log viewer */
+  .log-box { background: #0a0c10; border: 1px solid var(--border); border-radius: 8px;
+             padding: 12px; font-family: 'JetBrains Mono', 'Fira Code', monospace;
+             font-size: 0.8rem; line-height: 1.6; max-height: 400px; overflow-y: auto;
+             color: var(--text-dim); white-space: pre-wrap; word-break: break-all; }
+  .log-box .ok { color: var(--green); }
+  .log-box .err { color: var(--red); }
+  .log-box .warn { color: var(--yellow); }
+
+  /* Status badge */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 500; }
+  .badge-running { background: #1e3a5f; color: #60a5fa; }
+  .badge-done { background: #14532d; color: #4ade80; }
+  .badge-error { background: #7f1d1d; color: #fca5a5; }
+
+  /* Accounts table */
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-dim); font-weight: 500; font-size: 0.8rem; position: sticky; top: 0; background: var(--card); }
+  tr:hover { background: rgba(99, 102, 241, 0.05); }
+
+  /* Task list */
+  .task-item { display: flex; justify-content: space-between; align-items: center;
+               padding: 10px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .task-item:hover { background: rgba(99, 102, 241, 0.05); }
+  .task-item:last-child { border-bottom: none; }
+  .task-meta { font-size: 0.8rem; color: var(--text-muted); }
+
+  /* Domain tag */
+  .domain-today { font-size: 0.7rem; color: var(--green); margin-left: 4px; }
+
+  /* Responsive */
+  @media (max-width: 640px) {
+    .form-row { flex-direction: column; }
+    input, select { min-width: 100%; }
+    .tabs { overflow-x: auto; flex-wrap: nowrap; }
+    .settings-bar { flex-direction: column; align-items: stretch; }
+    .proxy-group { min-width: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1><span>Codex</span> Toolkit</h1>
+
+  <!-- Settings Bar -->
+  <div class="settings-bar">
+    <label>Proxy</label>
+    <div class="proxy-group">
+      <input type="text" id="proxy-input" placeholder="http://host:port, socks5://host:port, host:port ...">
+      <button class="btn btn-sm btn-primary" onclick="saveProxy()">Save</button>
+      <button class="btn btn-sm btn-ghost" onclick="clearProxy()">Reset</button>
+      <span id="proxy-badge" class="proxy-badge"></span>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="accounts">Accounts</div>
+    <div class="tab" data-tab="register">Register</div>
+    <div class="tab" data-tab="writeback">Writeback</div>
+    <div class="tab" data-tab="session">Session</div>
+    <div class="tab" data-tab="relogin">Relogin</div>
+    <div class="tab" data-tab="oauth">OAuth</div>
+    <div class="tab" data-tab="oauth-free">OAuth-Free</div>
+    <div class="tab" data-tab="health">Health Check</div>
+    <div class="tab" data-tab="deactivation">Deactivation Scan</div>
+    <div class="tab" data-tab="tasks">Tasks</div>
+  </div>
+
+  <!-- Accounts -->
+  <div id="tab-accounts" class="panel active">
+    <div class="card">
+      <h3>Data Manager Accounts</h3>
+      <div class="form-row" style="margin-bottom:16px">
+        <input type="text" id="acct-search" placeholder="Search email..." style="flex:1">
+        <button class="btn btn-primary btn-sm" onclick="loadAccounts()">Refresh</button>
+      </div>
+      <div class="table-wrap" style="max-height:500px; overflow-y:auto">
+        <table>
+          <thead><tr><th>ID</th><th>Email</th><th>Category</th><th>Token Ctx</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody id="acct-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Register -->
+  <div id="tab-register" class="panel">
+    <div class="card">
+      <h3>Register New Accounts</h3>
+      <div class="form-row">
+        <div class="form-group"><label>Count</label><input type="number" id="reg-count" value="1" min="1"></div>
+        <div class="form-group"><label>Email (optional)</label><input type="text" id="reg-email" placeholder="auto-generate"></div>
+        <div class="form-group"><label>Domain</label>
+          <select id="reg-domain">
+            <option value="">Auto (daily rotation)</option>
+          </select>
+        </div>
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="reg-rt"><label for="reg-rt" style="cursor:pointer">Get RT</label>
+        </div>
+        <button class="btn btn-primary" onclick="doRegister()">Register</button>
+      </div>
+    </div>
+    <div id="reg-log" class="card" style="display:none">
+      <h3>Progress <span id="reg-status" class="badge"></span></h3>
+      <div class="log-box" id="reg-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Writeback -->
+  <div id="tab-writeback" class="panel">
+    <div class="card">
+      <h3>DM Writeback</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Get team session AT and write back to Data Manager. Leave email empty to process all candidates.
+      </p>
+      <div class="form-row">
+        <div class="form-group"><label>Email (optional)</label><input type="text" id="wb-email" placeholder="all candidates"></div>
+        <div class="form-group"><label>Count (0=all)</label><input type="number" id="wb-count" value="0" min="0"></div>
+        <button class="btn btn-primary" onclick="doWriteback()">Writeback</button>
+      </div>
+    </div>
+    <div id="wb-log" class="card" style="display:none">
+      <h3>Progress <span id="wb-status" class="badge"></span></h3>
+      <div class="log-box" id="wb-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Session -->
+  <div id="tab-session" class="panel">
+    <div class="card">
+      <h3>Get ChatGPT Session AT</h3>
+      <div class="form-row">
+        <div class="form-group"><label>Email</label><input type="text" id="sess-email" placeholder="required"></div>
+        <button class="btn btn-primary" onclick="doSession()">Get Session</button>
+      </div>
+    </div>
+    <div id="sess-log" class="card" style="display:none">
+      <h3>Progress <span id="sess-status" class="badge"></span></h3>
+      <div class="log-box" id="sess-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Relogin -->
+  <div id="tab-relogin" class="panel">
+    <div class="card">
+      <h3>Relogin (token_context=unknown)</h3>
+      <div class="form-row">
+        <div class="form-group"><label>Email (optional)</label><input type="text" id="rel-email" placeholder="auto pick"></div>
+        <div class="form-group"><label>Count</label><input type="number" id="rel-count" value="1" min="1"></div>
+        <button class="btn btn-primary" onclick="doRelogin()">Relogin</button>
+      </div>
+    </div>
+    <div id="rel-log" class="card" style="display:none">
+      <h3>Progress <span id="rel-status" class="badge"></span></h3>
+      <div class="log-box" id="rel-log-box"></div>
+    </div>
+  </div>
+
+  <!-- OAuth -->
+  <div id="tab-oauth" class="panel">
+    <div class="card">
+      <h3>CPA OAuth (team -> CPA-B)</h3>
+      <div class="form-row">
+        <div class="form-group"><label>Email (optional)</label><input type="text" id="oa-email" placeholder="auto pick"></div>
+        <div class="form-group"><label>Count (0=all)</label><input type="number" id="oa-count" value="0" min="0"></div>
+        <button class="btn btn-primary" onclick="doOAuth()">Start OAuth</button>
+      </div>
+    </div>
+    <div id="oa-log" class="card" style="display:none">
+      <h3>Progress <span id="oa-status" class="badge"></span></h3>
+      <div class="log-box" id="oa-log-box"></div>
+    </div>
+  </div>
+
+  <!-- OAuth-Free -->
+  <div id="tab-oauth-free" class="panel">
+    <div class="card">
+      <h3>OAuth-Free (DM accounts -> free CPA)</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        OAuth non-deactivated DM accounts into free CPA. Skips accounts already in CPA.
+      </p>
+      <div class="form-row">
+        <div class="form-group"><label>Email (optional)</label><input type="text" id="of-email" placeholder="all candidates"></div>
+        <div class="form-group"><label>Count (0=all)</label><input type="number" id="of-count" value="0" min="0"></div>
+        <div class="form-group"><label>Category</label>
+          <select id="of-category">
+            <option value="">All</option>
+            <option value="enterprise">enterprise</option>
+            <option value="business">business</option>
+            <option value="plus">plus</option>
+            <option value="free">free</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" onclick="doOAuthFree()">Start OAuth-Free</button>
+      </div>
+    </div>
+    <div id="of-log" class="card" style="display:none">
+      <h3>Progress <span id="of-status" class="badge"></span></h3>
+      <div class="log-box" id="of-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Health Check -->
+  <div id="tab-health" class="panel">
+    <div class="card">
+      <h3>CPAB Health Check</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Verify all codex auth-files in CPAB via DM token/verify. Expired or deactivated entries are auto-deleted.
+      </p>
+      <div class="form-row">
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="hc-dry-run"><label for="hc-dry-run" style="cursor:pointer">Dry Run (check only, no delete)</label>
+        </div>
+        <button class="btn btn-primary" onclick="doHealthCheck()">Run Health Check</button>
+      </div>
+    </div>
+    <div id="hc-log" class="card" style="display:none">
+      <h3>Progress <span id="hc-status" class="badge"></span></h3>
+      <div class="log-box" id="hc-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Deactivation Scan -->
+  <div id="tab-deactivation" class="panel">
+    <div class="card">
+      <h3>Deactivation Scan</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Scan all DM accounts for OpenAI deactivation emails. Deactivated accounts are deleted from CPAB and disabled in DM.
+      </p>
+      <div class="form-row">
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="ds-dry-run"><label for="ds-dry-run" style="cursor:pointer">Dry Run (check only)</label>
+        </div>
+        <div class="form-group"><label>Category (optional)</label>
+          <select id="ds-category">
+            <option value="">All</option>
+            <option value="enterprise">enterprise</option>
+            <option value="business">business</option>
+            <option value="plus">plus</option>
+            <option value="free">free</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" onclick="doDeactivationScan()">Scan</button>
+      </div>
+    </div>
+    <div id="ds-log" class="card" style="display:none">
+      <h3>Progress <span id="ds-status" class="badge"></span></h3>
+      <div class="log-box" id="ds-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Tasks -->
+  <div id="tab-tasks" class="panel">
+    <div class="card">
+      <h3>Recent Tasks <button class="btn btn-sm btn-primary" onclick="loadTasks()" style="margin-left:8px">Refresh</button></h3>
+      <div id="tasks-list"></div>
+    </div>
+    <div id="task-detail" class="card" style="display:none">
+      <h3>Task Detail <span id="task-detail-status" class="badge"></span></h3>
+      <div class="log-box" id="task-detail-log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';  // Same origin
+/*__SERVER_CONFIG__*/
+let _cfg = window.__CFG__ || {};
+
+// ── Init ──
+async function init() {
+  if (!_cfg.domains) {
+    try {
+      const r = await fetch(API + '/api/config');
+      _cfg = await r.json();
+    } catch(e) { console.warn('config fetch failed, using injected', e); }
+  }
+  populateDomainDropdown();
+  await loadProxy();
+  loadAccounts();
+}
+
+function populateDomainDropdown() {
+  const sel = document.getElementById('reg-domain');
+  const domains = _cfg.domains || [];
+  const today = _cfg.today_domain || '';
+
+  // Clear existing options except the first "Auto" one
+  while (sel.options.length > 1) sel.remove(1);
+
+  // Update the "Auto" option text with today's domain
+  if (today) {
+    sel.options[0].textContent = `Auto rotation (${today})`;
+  }
+
+  domains.forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d;
+    opt.textContent = d + (d === today ? ' (today)' : '');
+    sel.appendChild(opt);
+  });
+}
+
+// ── Proxy ──
+async function loadProxy() {
+  try {
+    const r = await fetch(API + '/api/proxy');
+    const data = await r.json();
+    const badge = document.getElementById('proxy-badge');
+    const input = document.getElementById('proxy-input');
+
+    if (data.has_override && data.runtime_override) {
+      badge.textContent = 'Override: ' + data.runtime_override;
+      badge.className = 'proxy-badge proxy-badge-on';
+      input.value = data.active_raw || '';
+    } else if (data.active) {
+      badge.textContent = 'Config: ' + data.config_default;
+      badge.className = 'proxy-badge proxy-badge-default';
+      input.value = '';
+      input.placeholder = data.config_default || 'http://host:port ...';
+    } else {
+      badge.textContent = 'No proxy';
+      badge.className = 'proxy-badge proxy-badge-off';
+      input.value = '';
+    }
+  } catch(e) { console.error('loadProxy', e); }
+}
+
+async function saveProxy() {
+  const val = document.getElementById('proxy-input').value.trim();
+  if (!val) return clearProxy();
+  try {
+    const r = await fetch(API + '/api/proxy', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({proxy: val}),
+    });
+    const data = await r.json();
+    if (!r.ok) { alert(data.detail || 'Invalid proxy'); return; }
+    loadProxy();
+  } catch(e) { alert('Failed: ' + e.message); }
+}
+
+async function clearProxy() {
+  try {
+    await fetch(API + '/api/proxy', {method: 'DELETE'});
+    document.getElementById('proxy-input').value = '';
+    loadProxy();
+  } catch(e) { console.error(e); }
+}
+
+// ── Tabs ──
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+    if (tab.dataset.tab === 'accounts') loadAccounts();
+    if (tab.dataset.tab === 'tasks') loadTasks();
+  });
+});
+
+// ── Accounts ──
+let allAccounts = [];
+async function loadAccounts() {
+  try {
+    const r = await fetch(API + '/api/accounts');
+    const data = await r.json();
+    allAccounts = data.accounts || [];
+    renderAccounts();
+  } catch(e) { console.error(e); }
+}
+
+function renderAccounts() {
+  const q = (document.getElementById('acct-search').value || '').toLowerCase();
+  const filtered = q ? allAccounts.filter(a => (a.email||'').toLowerCase().includes(q)) : allAccounts;
+  const tbody = document.getElementById('acct-tbody');
+  tbody.innerHTML = filtered.slice(0, 100).map(a => {
+    const tc = a.token_context || '?';
+    const tcColor = tc === 'team' ? 'var(--green)' : tc === 'free' ? 'var(--primary)' : 'var(--yellow)';
+    const st = a.status || '?';
+    const stColor = st === 'active' ? 'var(--green)' : 'var(--red)';
+    return `<tr>
+      <td>${a.id||''}</td>
+      <td style="font-family:monospace;font-size:0.8rem">${a.email||''}</td>
+      <td>${a.category||''}</td>
+      <td><span style="color:${tcColor}">${tc}</span></td>
+      <td><span style="color:${stColor}">${st}</span></td>
+      <td>
+        <button class="btn btn-sm btn-green" onclick="quickWriteback('${a.email}')">WB</button>
+        <button class="btn btn-sm btn-primary" onclick="quickSession('${a.email}')">Sess</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+document.getElementById('acct-search').addEventListener('input', renderAccounts);
+
+function quickWriteback(email) {
+  if (!confirm(`Writeback: ${email}?`)) return;
+  submitTask('/api/writeback', {email}, 'wb');
+  document.querySelector('[data-tab="writeback"]').click();
+  document.getElementById('wb-email').value = email;
+}
+
+function quickSession(email) {
+  submitTask('/api/session', {email}, 'sess');
+  document.querySelector('[data-tab="session"]').click();
+  document.getElementById('sess-email').value = email;
+}
+
+// ── Command handlers ──
+function doRegister() {
+  const body = {
+    count: parseInt(document.getElementById('reg-count').value) || 1,
+    email: document.getElementById('reg-email').value || null,
+    domain: document.getElementById('reg-domain').value || null,
+    rt: document.getElementById('reg-rt').checked,
+  };
+  submitTask('/api/register', body, 'reg');
+}
+
+function doWriteback() {
+  submitTask('/api/writeback', {
+    email: document.getElementById('wb-email').value || null,
+    count: parseInt(document.getElementById('wb-count').value) || 0,
+  }, 'wb');
+}
+
+function doSession() {
+  const email = document.getElementById('sess-email').value;
+  if (!email) return alert('Email is required');
+  submitTask('/api/session', {email}, 'sess');
+}
+
+function doRelogin() {
+  submitTask('/api/relogin', {
+    email: document.getElementById('rel-email').value || null,
+    count: parseInt(document.getElementById('rel-count').value) || 1,
+  }, 'rel');
+}
+
+function doOAuth() {
+  submitTask('/api/oauth', {
+    email: document.getElementById('oa-email').value || null,
+    count: parseInt(document.getElementById('oa-count').value) || 0,
+  }, 'oa');
+}
+
+function doOAuthFree() {
+  submitTask('/api/oauth-free', {
+    email: document.getElementById('of-email').value || null,
+    count: parseInt(document.getElementById('of-count').value) || 0,
+    category: document.getElementById('of-category').value || null,
+  }, 'of');
+}
+
+function doHealthCheck() {
+  submitTask('/api/health-check', {
+    dry_run: document.getElementById('hc-dry-run').checked,
+  }, 'hc');
+}
+
+function doDeactivationScan() {
+  submitTask('/api/deactivation-scan', {
+    dry_run: document.getElementById('ds-dry-run').checked,
+    category: document.getElementById('ds-category').value || null,
+  }, 'ds');
+}
+
+// ── Task submission + polling ──
+async function submitTask(endpoint, body, prefix) {
+  const logCard = document.getElementById(prefix + '-log');
+  const logBox = document.getElementById(prefix + '-log-box');
+  const statusBadge = document.getElementById(prefix + '-status');
+
+  logCard.style.display = 'block';
+  logBox.textContent = 'Starting...\n';
+  statusBadge.textContent = 'running';
+  statusBadge.className = 'badge badge-running';
+
+  try {
+    const r = await fetch(API + endpoint, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    const taskId = data.task_id;
+    if (!taskId) { logBox.textContent = 'Error: ' + JSON.stringify(data); return; }
+
+    // Poll
+    const poll = setInterval(async () => {
+      try {
+        const tr = await fetch(API + '/api/tasks/' + taskId);
+        const task = await tr.json();
+        logBox.innerHTML = (task.logs || []).map(colorize).join('\n');
+        logBox.scrollTop = logBox.scrollHeight;
+
+        if (task.status !== 'running') {
+          clearInterval(poll);
+          statusBadge.textContent = task.status;
+          statusBadge.className = 'badge badge-' + task.status;
+          if (task.result) {
+            logBox.innerHTML += '\n\n' + colorize(JSON.stringify(task.result, null, 2));
+          }
+        }
+      } catch(e) { console.error(e); }
+    }, 1500);
+  } catch(e) {
+    logBox.textContent = 'Request failed: ' + e.message;
+    statusBadge.textContent = 'error';
+    statusBadge.className = 'badge badge-error';
+  }
+}
+
+function colorize(line) {
+  if (!line) return '';
+  const escaped = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return escaped
+    .replace(/(✅[^\n]*)/g, '<span class="ok">$1</span>')
+    .replace(/(❌[^\n]*)/g, '<span class="err">$1</span>')
+    .replace(/(⚠️[^\n]*)/g, '<span class="warn">$1</span>')
+    .replace(/(Summary:[^\n]*)/g, '<span class="ok">$1</span>');
+}
+
+// ── Tasks list ──
+async function loadTasks() {
+  try {
+    const r = await fetch(API + '/api/tasks');
+    const data = await r.json();
+    const list = document.getElementById('tasks-list');
+    if (!data.length) { list.innerHTML = '<p style="color:var(--text-muted);padding:12px">No tasks yet</p>'; return; }
+    list.innerHTML = data.map(t => {
+      const time = t.created_at ? new Date(t.created_at + 'Z').toLocaleTimeString() : '';
+      return `<div class="task-item" onclick="viewTask('${t.id}')">
+        <div>
+          <strong>${t.command}</strong>
+          <span class="task-meta" style="margin-left:8px">${time}</span>
+        </div>
+        <span class="badge badge-${t.status}">${t.status}</span>
+      </div>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function viewTask(taskId) {
+  try {
+    const r = await fetch(API + '/api/tasks/' + taskId);
+    const task = await r.json();
+    const detail = document.getElementById('task-detail');
+    const log = document.getElementById('task-detail-log');
+    const badge = document.getElementById('task-detail-status');
+    detail.style.display = 'block';
+    badge.textContent = task.status;
+    badge.className = 'badge badge-' + task.status;
+    log.innerHTML = (task.logs || []).map(colorize).join('\n');
+    if (task.result) log.innerHTML += '\n\n' + colorize(JSON.stringify(task.result, null, 2));
+  } catch(e) { console.error(e); }
+}
+
+// Init
+init();
+</script>
+</body>
+</html>

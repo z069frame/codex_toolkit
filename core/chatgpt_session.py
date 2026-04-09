@@ -1,37 +1,41 @@
 """
-ChatGPT Web Session — 纯脚本获取完整权限 AT。
+ChatGPT Web Session & Full OAuth Token Exchange.
 
-直接在 ChatGPT NextAuth OAuth 上下文中完成 auth.openai.com 登录,
-OTP 验证成功后 auth.openai.com 返回 chatgpt.com callback URL,
-访问该 URL 触发 NextAuth 设置 session cookie,
-最后用 session cookie 换取完整权限 AT。
+两种获取方式:
+  1) get_chatgpt_session_at()  — 通过 NextAuth session cookie 换取 AT (无 RT)
+  2) get_chatgpt_full_tokens() — 自建 PKCE OAuth 流程, 获取 AT + RT
 
 ChatGPT OAuth scopes (client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH):
   openid, email, profile, offline_access,
   model.request, model.read, organization.read, organization.write
 
-关键发现:
-  - OTP validate 接口直接返回 continue_url 指向 chatgpt.com/api/auth/callback/openai
-  - 不需要额外的 workspace/select 步骤
-  - follow callback URL → NextAuth 设置 session cookie → exchange for AT
-
 用法:
   result = get_chatgpt_session_at(email, password, otp_token, proxy)
+  result = get_chatgpt_full_tokens(email, password, otp_token, proxy)
 """
 from __future__ import annotations
 
 import base64
 import json
 import logging
+import secrets
 import time
+from urllib.parse import urlencode, urlparse, parse_qs
 
 from curl_cffi import requests as cffi_requests
 
 from .openai_auth import (
+    _gen_pkce,
+    _gen_state,
+    _build_oauth_url,
     _get_cookie,
     _get_sentinel,
     _safe_json,
+    oauth_login,
     AUTH_BASE,
+    TOKEN_URL,
+    CLIENT_ID as CODEX_CLIENT_ID,
+    DEFAULT_REDIRECT_URI as CODEX_REDIRECT_URI,
     SIGNUP_URL,
     PASSWORD_VERIFY_URL,
     SEND_OTP_URL,
@@ -400,3 +404,88 @@ def get_chatgpt_session_at(
         return {"ok": False, "error": str(e)}
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+#  Full PKCE OAuth — get AT + RT via Codex public client
+# ---------------------------------------------------------------------------
+
+def get_chatgpt_full_tokens(
+    email: str,
+    password: str,
+    otp_token: str,
+    proxy: str | None = None,
+) -> dict:
+    """
+    Full PKCE OAuth using the Codex public client (app_EMoamEEZ73f0CkXaXp7hrann).
+
+    The ChatGPT client (app_X8zY6vW2pQ9tR3dE7nK1jL5gH) is confidential and
+    requires a server-side client_secret held by NextAuth, so we can't exchange
+    its codes directly.  The Codex client is a public PKCE client whose token
+    exchange is proven to work.
+
+    Scopes: openid email profile offline_access
+    - AT still contains chatgpt_plan_type in JWT claims → useful for plan checks
+    - RT can be refreshed after team subscription → new AT reflects team plan
+
+    Returns: {ok, access_token, refresh_token, id_token, email, error}
+    """
+    # ── Step 1: Generate PKCE & build authorize URL ──
+    code_verifier, code_challenge = _gen_pkce()
+    state = _gen_state()
+    auth_url = _build_oauth_url(CODEX_CLIENT_ID, CODEX_REDIRECT_URI,
+                                code_challenge, state)
+
+    logger.info("[chatgpt-rt] %s - starting PKCE OAuth (Codex client)", email)
+
+    # ── Step 2: Complete login via oauth_login (handles email/pw/OTP/workspace) ──
+    code, ret_state, err = oauth_login(auth_url, email, password, otp_token, proxy)
+    if not code:
+        return {"ok": False, "error": f"oauth_login: {err}"}
+
+    logger.info("[chatgpt-rt] %s - got auth code (len=%d), exchanging tokens", email, len(code))
+
+    # ── Step 3: Token exchange (clean request, no session cookies) ──
+    exchange_data = urlencode({
+        "grant_type": "authorization_code",
+        "client_id": CODEX_CLIENT_ID,
+        "code": code,
+        "redirect_uri": CODEX_REDIRECT_URI,
+        "code_verifier": code_verifier,
+    })
+    r = cffi_requests.post(
+        TOKEN_URL,
+        data=exchange_data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        impersonate="chrome120",
+        proxies={"https": proxy, "http": proxy} if proxy else None,
+        timeout=30,
+    )
+    logger.info("[chatgpt-rt] %s - token exchange: HTTP %d, len=%d",
+                 email, r.status_code, len(r.text))
+
+    if r.status_code != 200:
+        return {"ok": False,
+                "error": f"token_exchange_{r.status_code}: {r.text[:300]}"}
+
+    tokens = _safe_json(r)
+    at = tokens.get("access_token", "")
+    rt = tokens.get("refresh_token", "")
+
+    if not at:
+        return {"ok": False, "error": f"no_access_token: {str(tokens)[:300]}"}
+
+    logger.info("[chatgpt-rt] %s - SUCCESS! AT len=%d, RT len=%d",
+                 email, len(at), len(rt))
+
+    return {
+        "ok": True,
+        "access_token": at,
+        "refresh_token": rt,
+        "id_token": tokens.get("id_token", ""),
+        "expires_in": tokens.get("expires_in"),
+        "email": email,
+    }

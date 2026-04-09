@@ -133,6 +133,66 @@ class CPAAdmin:
             return max(team, key=lambda x: x["id"])
         return max(matches, key=lambda x: x["id"])
 
+    def delete_auth_file(self, auth_id: int) -> bool:
+        ok, st, d = _http(
+            f"{self.base}/v0/admin/auth-files/{auth_id}",
+            method="DELETE",
+            headers=self._headers(),
+        )
+        return ok or st in (200, 204)
+
+    def extract_codex_auths(self, files: list | None = None) -> list:
+        """Extract & deduplicate codex auth entries from auth-files.
+        Returns list of {email, auth_id, access_token, plan_type}."""
+        if files is None:
+            files = self.list_auth_files()
+        by_key = {}
+        for f in files:
+            content = f.get("content") or {}
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except Exception:
+                    continue
+            ftype = str(content.get("type") or "").lower()
+            if "codex" not in ftype:
+                continue
+            email = (content.get("email") or "").strip().lower()
+            at = (content.get("access_token") or "").strip()
+            auth_id = f.get("id") or 0
+            if not email or not at or len(at) < 100:
+                continue
+            plan = _detect_plan(at)
+            key = (email, plan)
+            if key not in by_key or auth_id > by_key[key]["auth_id"]:
+                by_key[key] = {
+                    "email": email,
+                    "auth_id": auth_id,
+                    "access_token": at,
+                    "plan_type": plan,
+                }
+        return list(by_key.values())
+
+    def collect_auth_ids_for_emails(self, emails: set, files: list | None = None) -> list:
+        """Get all raw codex auth-ids matching a set of emails."""
+        if files is None:
+            files = self.list_auth_files()
+        result = []
+        for f in files:
+            content = f.get("content") or {}
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except Exception:
+                    continue
+            ftype = str(content.get("type") or "").lower()
+            if "codex" not in ftype:
+                continue
+            femail = (content.get("email") or "").strip().lower()
+            if femail in emails:
+                result.append({"email": femail, "auth_id": f.get("id")})
+        return result
+
     def has_team_auth_for_email(self, email: str) -> bool:
         files = self.list_auth_files()
         email_lower = email.lower()
@@ -456,25 +516,64 @@ class DataManager:
 
 
 # ---------------------------------------------------------------------------
-#  Deactivated Check (mail service)
+#  Deactivated Check (via otp-inbox /api/emails)
 # ---------------------------------------------------------------------------
+
+# OpenAI deactivation email indicators
+_DEACTIVATION_SENDERS = {"noreply@tm.openai.com", "noreply@openai.com"}
+_DEACTIVATION_KEYWORDS = [
+    "deactivated", "disabled", "terminated", "banned", "suspended",
+    "account has been", "violation", "policy",
+]
+
 
 def check_deactivated(email: str, otp_token: str) -> dict:
     """
-    Check if an email has been deactivated by OpenAI.
-    Uses the mail service at m.{domain}/api/check-deactivated.
-    Returns {"deactivated": bool, "matched_count": int, ...}
+    Check if an OpenAI account has been deactivated by searching
+    the otp-inbox mailbox for deactivation notice emails.
+
+    Uses GET https://m.<domain>/api/emails?to=<email>&limit=50
+
+    Returns {"deactivated": bool, "matched_count": int, "matches": [...]}
     """
     domain = email.split("@", 1)[-1] if "@" in email else ""
     if not domain:
         return {"deactivated": False, "error": "invalid_email"}
-    url = f"https://m.{domain}/api/check-deactivated?email={email}"
+
+    url = f"https://m.{domain}/api/emails?to={email}&limit=50"
     headers = {"Authorization": f"Bearer {otp_token}"}
     ok, st, d = _http(url, headers=headers)
     if not ok:
         logger.warning("check_deactivated failed for %s: status=%d %s", email, st, d)
         return {"deactivated": False, "error": f"http_{st}"}
-    return d
+
+    # d can be a list or {"items": [...]} or {"data": [...]}
+    emails = d if isinstance(d, list) else (d.get("items") or d.get("data") or [])
+
+    matches = []
+    for msg in emails:
+        sender = (msg.get("mail_from") or msg.get("from") or "").lower()
+        subject = (msg.get("subject") or "").lower()
+        snippet = (msg.get("snippet") or "").lower()
+        body = (msg.get("body_text") or "").lower()
+        searchable = f"{subject} {snippet} {body}"
+
+        # Must be from OpenAI
+        if not any(s in sender for s in _DEACTIVATION_SENDERS):
+            continue
+        # Must contain deactivation keywords
+        if any(kw in searchable for kw in _DEACTIVATION_KEYWORDS):
+            matches.append({
+                "subject": msg.get("subject", ""),
+                "from": msg.get("mail_from", ""),
+                "date": msg.get("created_at", ""),
+            })
+
+    return {
+        "deactivated": len(matches) > 0,
+        "matched_count": len(matches),
+        "matches": matches[:5],
+    }
 
 
 # ---------------------------------------------------------------------------

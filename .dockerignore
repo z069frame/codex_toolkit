@@ -1,0 +1,16 @@
+.git
+.github
+.claude
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.DS_Store
+.idea
+.vscode
+output/
+tmp/
+config.json
+.runtime_proxy
+*.md
