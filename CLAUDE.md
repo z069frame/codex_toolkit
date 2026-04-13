@@ -79,3 +79,22 @@ All sort by: error status first, then id ascending.
 ## Output
 
 Generated auth files are saved to the `output/` directory as `<email>.json` and `<email>.session.json`.
+
+## Testing
+
+Tests live in `tests/` and are run with `pytest`.
+
+```bash
+pip install -r requirements-dev.txt
+
+pytest                  # offline suite; live probes auto-skipped
+pytest --collect-only -q
+pytest -m live          # runs the ChatGPT / CPA / OAuth probes; requires config.json + network
+```
+
+Every test that hits real external services (ChatGPT backend-api, CPA-B,
+`auth.openai.com`, or DataManager) must be decorated with
+`@pytest.mark.live`. The default `pytest` run collects but skips them so
+CI never touches OpenAI. See `tests/conftest.py` for the stub fixtures
+(`stub_config`, `mock_dm`, `mock_cpa_admin`, `mock_cpa_mgmt`) used by
+offline tests, and `tests/README.md` for full instructions.

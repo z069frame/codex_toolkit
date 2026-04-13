@@ -51,3 +51,21 @@ All runtime config lives in `config.json` at the repo root. Contains domains, AP
 ## Output
 
 Generated auth files are saved to the `output/` directory as `<email>.json`.
+
+## Testing
+
+Tests live in `tests/` and are run with `pytest`.
+
+```bash
+pip install -r requirements-dev.txt
+
+pytest                  # offline suite; live probes auto-skipped
+pytest --collect-only -q
+pytest -m live          # runs the ChatGPT / CPA / OAuth probes; requires config.json + network
+```
+
+Anything that touches real external services must be decorated with
+`@pytest.mark.live`. The default `pytest` run collects them but skips them,
+so CI never hits OpenAI / CPA-B. The fixtures `stub_config`, `mock_dm`,
+`mock_cpa_admin`, and `mock_cpa_mgmt` in `tests/conftest.py` cover the
+offline side.
