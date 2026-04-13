@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from curl_cffi import requests as cffi_requests
 
 from .email_gen import random_birthdate, random_display_name
-from .otp import fetch_otp
+from .otp import get_otp_provider
 from .sentinel import SENTINEL_URL, build_sentinel_pow_token
 
 logger = logging.getLogger(__name__)
@@ -291,6 +291,15 @@ def register_account(
     """
     session, chrome_ver = _create_session(proxy)
 
+    # Build provider once per call; preserves legacy fetch_otp() defaults
+    # (MAX_RETRIES=8 attempts at RETRY_INTERVAL=8s each → 64s total).
+    otp_provider = get_otp_provider({
+        "otp": {
+            "provider": "inbox",
+            "inbox": {"token": otp_token, "poll_interval_s": 8},
+        }
+    })
+
     try:
         used_codes = set()
 
@@ -365,7 +374,7 @@ def register_account(
 
         # 7) Fetch + validate OTP
         domain = email.split("@")[1]
-        otp_code = fetch_otp(email, domain, otp_token)
+        otp_code = otp_provider.wait_for_code(email, timeout=8 * 8)
         if not otp_code:
             return {"ok": False, "error": "otp_fetch_failed"}
         used_codes.add(otp_code)
@@ -471,6 +480,15 @@ def oauth_login(
     """
     session, _ = _create_session(proxy)
 
+    # Build provider once per call; preserves legacy fetch_otp() semantics
+    # (max_retries=6, retry_interval=5 → 30s total with 5s poll cadence).
+    otp_provider = get_otp_provider({
+        "otp": {
+            "provider": "inbox",
+            "inbox": {"token": otp_token, "poll_interval_s": 5},
+        }
+    })
+
     try:
         # 1) Visit OAuth URL
         logger.info("[oauth] %s - visiting oauth URL", email)
@@ -522,9 +540,8 @@ def oauth_login(
 
                 wait = 10 if otp_attempt == 0 else 5
                 time.sleep(wait)
-                otp_code = fetch_otp(email, domain, otp_token,
-                                     max_retries=6, retry_interval=5,
-                                     skip_codes=_skip)
+                otp_code = otp_provider.wait_for_code(
+                    email, timeout=6 * 5, skip_codes=frozenset(_skip))
                 if not otp_code:
                     if otp_attempt < 2:
                         continue
@@ -602,6 +619,15 @@ def _do_login_phase(session, email, password, otp_token, skip_codes=None,
     Returns (ok: bool, error: str | None, otp_used: str | None).
     ``otp_used`` is the OTP that succeeded (if any) — caller can cache.
     """
+    # Build provider once per call; preserves legacy fetch_otp() semantics
+    # (max_retries=6, retry_interval=5 → 30s total with 5s poll cadence).
+    otp_provider = get_otp_provider({
+        "otp": {
+            "provider": "inbox",
+            "inbox": {"token": otp_token, "poll_interval_s": 5},
+        }
+    })
+
     did = _get_cookie(session, "oai-did") or ""
     _, sentinel_header = _get_sentinel(session, did, "authorize_continue")
 
@@ -650,8 +676,8 @@ def _do_login_phase(session, email, password, otp_token, skip_codes=None,
             if attempt > 0:
                 session.post(SEND_OTP_URL, headers=hdrs, timeout=15)
             time.sleep(10 if attempt == 0 else 5)
-            otp_code = fetch_otp(email, domain, otp_token,
-                                 max_retries=6, retry_interval=5, skip_codes=_skip)
+            otp_code = otp_provider.wait_for_code(
+                email, timeout=6 * 5, skip_codes=frozenset(_skip))
             if not otp_code:
                 if attempt < 2:
                     continue
