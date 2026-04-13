@@ -42,7 +42,7 @@ from .openai_auth import (
     VERIFY_OTP_URL,
     WORKSPACE_URL,
 )
-from .otp import fetch_otp, peek_otp
+from .otp import get_otp_provider
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,15 @@ def get_chatgpt_session_at(
     """
     session = _create_chatgpt_session(proxy)
 
+    # Build provider once per call; preserves legacy fetch_otp() semantics
+    # (max_retries=18, retry_interval=10 → 180s total with 10s poll cadence).
+    otp_provider = get_otp_provider({
+        "otp": {
+            "provider": "inbox",
+            "inbox": {"token": otp_token, "poll_interval_s": 10},
+        }
+    })
+
     try:
         # ── Step 1: chatgpt.com → CSRF → NextAuth signin ──
         logger.info("[chatgpt] %s - visiting chatgpt.com", email)
@@ -196,7 +205,7 @@ def get_chatgpt_session_at(
         # first; if validate fails (HTTP != 200) we'll add it to skip_codes
         # and wait for a new one.
         domain = email.split("@")[1]
-        existing_otp = peek_otp(email, domain, otp_token)
+        existing_otp = otp_provider.peek(email)
         skip_codes: set = set()
         if existing_otp:
             logger.info("[chatgpt] %s - cached OTP present: %s (will try first)",
@@ -264,9 +273,8 @@ def get_chatgpt_session_at(
                 time.sleep(wait)
 
                 # ~180s window per fetch: enough for slow MX delivery paths
-                otp_code = fetch_otp(email, domain, otp_token,
-                                     max_retries=18, retry_interval=10,
-                                     skip_codes=skip_codes)
+                otp_code = otp_provider.wait_for_code(
+                    email, timeout=18 * 10, skip_codes=frozenset(skip_codes))
                 if not otp_code:
                     if otp_attempt < 2:
                         logger.info("[chatgpt] %s - OTP not received, will retry", email)
