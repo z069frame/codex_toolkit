@@ -516,6 +516,126 @@ class DataManager:
 
 
 # ---------------------------------------------------------------------------
+#  Payment Link Generation
+# ---------------------------------------------------------------------------
+
+def generate_payment_link(
+    access_token: str,
+    country: str = "US",
+    currency: str = "USD",
+    seat_quantity: int = 5,
+    price_interval: str = "month",
+    workspace_name: str | None = None,
+    proxy: str | None = None,
+) -> dict:
+    """
+    Generate a ChatGPT Team checkout payment link via POST /backend-api/payments/checkout.
+
+    Args:
+        access_token: Valid free-tier ChatGPT access token
+        country: Billing country code (US, DE, etc.)
+        currency: Currency (USD, EUR, etc.)
+        seat_quantity: Number of seats (min 2, default 9)
+        workspace_name: Team workspace name (auto-generated if None)
+        price_interval: "month" or "year"
+        proxy: Optional HTTP/SOCKS proxy
+
+    Returns:
+        {ok, payment_link, checkout_session_id, processor, error}
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return {"ok": False, "error": "curl_cffi not available"}
+
+    if not access_token or len(access_token) < 100:
+        return {"ok": False, "error": "invalid_access_token"}
+
+    # Derive workspace name from token email if not provided
+    if not workspace_name:
+        claims = decode_jwt_claims(access_token)
+        profile = claims.get("https://api.openai.com/profile", {})
+        email = profile.get("email", "")
+        prefix = email.split("@")[0] if email else "team"
+        import re as _re
+        prefix = _re.sub(r"[^a-zA-Z0-9]", "-", prefix)[:24]
+        import datetime as _dt
+        date_tag = _dt.datetime.utcnow().strftime("%Y%m%d")
+        workspace_name = f"team-{prefix}-{date_tag}"
+
+    payload = {
+        "plan_name": "chatgptteamplan",
+        "team_plan_data": {
+            "workspace_name": workspace_name,
+            "price_interval": price_interval,
+            "seat_quantity": max(2, seat_quantity),
+        },
+        "billing_details": {
+            "country": country,
+            "currency": currency,
+        },
+        "cancel_url": "https://chatgpt.com/#pricing",
+        "promo_campaign": {
+            "promo_campaign_id": "team-1-month-free",
+            "is_coupon_from_query_param": False,
+        },
+        "checkout_ui_mode": "custom",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "User-Agent": "PostmanRuntime/7.40.0",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+    }
+
+    proxies = {"https": proxy, "http": proxy} if proxy else None
+
+    try:
+        r = cffi_requests.post(
+            "https://chatgpt.com/backend-api/payments/checkout",
+            headers=headers,
+            json=payload,
+            impersonate="chrome136",
+            proxies=proxies,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"request_failed: {e}"}
+
+    if r.status_code not in (200, 201):
+        return {"ok": False, "error": f"http_{r.status_code}: {r.text[:300]}"}
+
+    try:
+        data = r.json()
+    except Exception:
+        return {"ok": False, "error": f"invalid_json: {r.text[:200]}"}
+
+    # Parse response — may be nested in "data"
+    inner = data.get("data", data)
+    session_id = inner.get("checkout_session_id", "")
+    processor = inner.get("processor_entity", "stripe")
+    direct_url = inner.get("url", "")
+
+    if direct_url:
+        link = direct_url
+    elif session_id:
+        link = f"https://chatgpt.com/checkout/{processor}/{session_id}"
+    else:
+        return {"ok": False, "error": f"no_session_id: {data}"}
+
+    return {
+        "ok": True,
+        "payment_link": link,
+        "checkout_session_id": session_id,
+        "processor": processor,
+        "workspace_name": workspace_name,
+    }
+
+
+# ---------------------------------------------------------------------------
 #  Deactivated Check (via otp-inbox /api/emails)
 # ---------------------------------------------------------------------------
 

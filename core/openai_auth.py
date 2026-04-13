@@ -576,3 +576,295 @@ def oauth_login(
         return None, None, str(e)
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+#  OAuth Login — ALL workspaces
+# ---------------------------------------------------------------------------
+
+def _decode_auth_cookie(auth_cookie: str) -> dict:
+    try:
+        seg = auth_cookie.split(".")[0]
+        pad = "=" * ((4 - len(seg) % 4) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg + pad))
+    except Exception:
+        try:
+            return json.loads(base64.b64decode(seg + pad))
+        except Exception:
+            return {}
+
+
+def _do_login_phase(session, email, password, otp_token, skip_codes=None,
+                    cached_otp=None):
+    """
+    Run email/password/OTP on an existing session.
+    If ``cached_otp`` is given, try that OTP first before fetching fresh.
+    Returns (ok: bool, error: str | None, otp_used: str | None).
+    ``otp_used`` is the OTP that succeeded (if any) — caller can cache.
+    """
+    did = _get_cookie(session, "oai-did") or ""
+    _, sentinel_header = _get_sentinel(session, did, "authorize_continue")
+
+    hdrs = {
+        "Referer": f"{AUTH_BASE}/log-in",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if sentinel_header:
+        hdrs["openai-sentinel-token"] = sentinel_header
+
+    logger.info("[oauth-multi] %s - submitting email", email)
+    r = session.post(SIGNUP_URL, headers=hdrs,
+                     data=json.dumps({"username": {"value": email, "kind": "email"},
+                                      "screen_hint": "login"}), timeout=30)
+    if r.status_code != 200:
+        return False, f"email_submit_{r.status_code}: {r.text[:200]}", None
+    resp = _safe_json(r)
+    page_type = (resp.get("page") or {}).get("type", "")
+
+    if page_type != "email_otp_verification":
+        logger.info("[oauth-multi] %s - submitting password", email)
+        r = session.post(PASSWORD_VERIFY_URL, headers=hdrs,
+                         data=json.dumps({"password": password}), timeout=30)
+        if r.status_code != 200:
+            return False, f"password_{r.status_code}: {r.text[:200]}", None
+        resp = _safe_json(r)
+        page_type = (resp.get("page") or {}).get("type", "")
+
+    if page_type in ("email_otp_verification", "email_otp"):
+        domain = email.split("@")[1]
+        _skip = set(skip_codes) if skip_codes else set()
+
+        # Try cached OTP first (multi-use within TTL)
+        if cached_otp and cached_otp not in _skip:
+            logger.info("[oauth-multi] %s - trying cached OTP: %s", email, cached_otp)
+            r = session.post(VERIFY_OTP_URL, headers=hdrs,
+                             data=json.dumps({"code": cached_otp}), timeout=30)
+            if r.status_code == 200:
+                return True, None, cached_otp
+            logger.info("[oauth-multi] %s - cached OTP rejected (HTTP %d), falling back to fetch",
+                        email, r.status_code)
+            _skip.add(cached_otp)
+
+        for attempt in range(3):
+            if attempt > 0:
+                session.post(SEND_OTP_URL, headers=hdrs, timeout=15)
+            time.sleep(10 if attempt == 0 else 5)
+            otp_code = fetch_otp(email, domain, otp_token,
+                                 max_retries=6, retry_interval=5, skip_codes=_skip)
+            if not otp_code:
+                if attempt < 2:
+                    continue
+                return False, "otp_fetch_failed", None
+            logger.info("[oauth-multi] %s - validating OTP: %s", email, otp_code)
+            r = session.post(VERIFY_OTP_URL, headers=hdrs,
+                             data=json.dumps({"code": otp_code}), timeout=30)
+            if r.status_code == 200:
+                return True, None, otp_code
+            _skip.add(otp_code)
+        return False, "otp_validate_failed", None
+
+    return True, None, None
+
+
+def _do_one_workspace(
+    start_oauth_fn, email, password, otp_token, proxy,
+    target_ws: dict | None, log_fn, cached_otp: str | None = None,
+) -> tuple[list | None, dict, str | None]:
+    """
+    Fresh session per workspace: get CPAB authorize URL → login (uses cached OTP
+    so it's fast) → select workspace → get code.
+    target_ws=None → discovery mode, uses workspaces[0].
+    Returns (workspaces_list or None, result_dict, otp_used).
+    """
+    def _log(msg):
+        if log_fn:
+            try: log_fn(msg)
+            except Exception: pass
+        logger.info(msg)
+
+    session, _ = _create_session(proxy)
+    try:
+        start = start_oauth_fn()
+        if not start.get("ok"):
+            return None, {"ok": False, "error": f"start_oauth_failed: {start}"}, None
+
+        oauth_url = start.get("url")
+        cpa_state = start.get("state")
+        if not oauth_url:
+            return None, {"ok": False, "error": "no_oauth_url"}, None
+
+        session.get(oauth_url, timeout=30)
+
+        ok, err, otp_used = _do_login_phase(
+            session, email, password, otp_token, cached_otp=cached_otp)
+        if not ok:
+            return None, {"ok": False, "error": err, "state": cpa_state}, None
+
+        auth_cookie = _get_cookie(session, "oai-client-auth-session")
+        ws_list = []
+        if auth_cookie:
+            ws_list = _decode_auth_cookie(auth_cookie).get("workspaces", [])
+
+        if not ws_list:
+            return None, {"ok": False, "error": "no_workspaces_in_cookie",
+                          "state": cpa_state}, otp_used
+
+        ws = target_ws if target_ws else ws_list[0]
+        ws_id = ws.get("id", "")
+        ws_name = ws.get("name") or "(unnamed)"
+        ws_kind = ws.get("kind", "")
+
+        _log(f"  → selecting {ws_name} ({ws_kind})")
+
+        r = session.post(WORKSPACE_URL, headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Referer": f"{AUTH_BASE}/sign-in-with-chatgpt/codex/consent",
+        }, data=json.dumps({"workspace_id": ws_id}), timeout=30)
+        cont = _safe_json(r).get("continue_url", "")
+
+        if not cont:
+            return ws_list, {
+                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+                "ok": False,
+                "error": f"no_continue_url (HTTP {r.status_code}): {r.text[:200]}",
+                "state": cpa_state,
+            }, otp_used
+
+        code, _st = _follow_redirects(session, cont)
+        if code:
+            _log(f"  ✅ code obtained (len={len(code)})")
+            return ws_list, {
+                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+                "ok": True, "code": code, "state": cpa_state,
+            }, otp_used
+
+        return ws_list, {
+            "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+            "ok": False, "error": "no_code_extracted", "state": cpa_state,
+        }, otp_used
+
+    except Exception as e:
+        logger.exception("[oauth-multi] %s - iter exception", email)
+        return None, {"ok": False, "error": str(e)}, None
+    finally:
+        session.close()
+
+
+def oauth_login_multi(
+    start_oauth_fn,
+    email: str,
+    password: str,
+    otp_token: str,
+    proxy: str | None = None,
+    workspace_filter: list | None = None,
+    log_fn=None,
+) -> dict:
+    """
+    OAuth ALL workspaces of an account into CPAB.
+
+    Strategy: fresh session per workspace. OpenAI creates a new auth_session on
+    each /authorize, so a single session can't switch workspaces mid-flight.
+    OTPs in otp-inbox are multi-use within TTL, so subsequent logins reuse the
+    cached code and we don't incur extra email delays.
+
+    Args:
+        start_oauth_fn: callable() -> {ok, url, state}.
+            Called once per workspace to get a fresh CPAB OAuth URL.
+        email, password, otp_token, proxy: login credentials.
+        workspace_filter: optional list of workspace_ids to limit to.
+        log_fn: optional callback(str) for task logging.
+
+    Returns: {
+        ok: bool,
+        workspaces: [{id, name, kind}, ...],
+        results: [{workspace_id, workspace_name, workspace_kind,
+                   ok, code, state, error}, ...],
+        error: str | None,
+    }
+    """
+    def _log(msg):
+        if log_fn:
+            try: log_fn(msg)
+            except Exception: pass
+        logger.info(msg)
+
+    # Iter 1: discover + OAuth workspace[0]
+    _log(f"[oauth-multi] {email} - iter 1 (discover + first workspace)")
+    ws_list, first_result, cached_otp = _do_one_workspace(
+        start_oauth_fn, email, password, otp_token, proxy, None, log_fn)
+
+    if ws_list is None:
+        return {"ok": False, "error": first_result.get("error", "unknown"),
+                "workspaces": [], "results": [first_result] if first_result.get("ok") is False else []}
+
+    _log(f"[oauth-multi] {email} - found {len(ws_list)} workspace(s):")
+    for w in ws_list:
+        _log(f"  • {w.get('name', '(unnamed)')} (kind={w.get('kind')}, id={w.get('id')})")
+    if cached_otp:
+        _log(f"[oauth-multi] {email} - cached OTP {cached_otp} for reuse")
+
+    # Filter: by ID if specified, otherwise skip personal workspaces
+    filtered = ws_list
+    if workspace_filter:
+        wanted = set(workspace_filter)
+        filtered = [w for w in ws_list if w.get("id") in wanted]
+        _log(f"[oauth-multi] {email} - filtered to {len(filtered)} workspace(s)")
+        first_ws_id = first_result.get("workspace_id")
+        if first_ws_id not in wanted:
+            first_result = None
+    else:
+        # Skip personal workspaces by default (free, no team features)
+        personal = [w for w in filtered if w.get("kind") == "personal"]
+        filtered = [w for w in filtered if w.get("kind") != "personal"]
+        if personal:
+            _log(f"[oauth-multi] {email} - skipping {len(personal)} personal workspace(s)")
+        first_ws_id = first_result.get("workspace_id")
+        if first_ws_id and first_ws_id in {w.get("id") for w in personal}:
+            first_result = None
+
+    results = []
+    done_ids = set()
+
+    if first_result is not None:
+        results.append(first_result)
+        done_ids.add(first_result.get("workspace_id"))
+
+    # For each remaining workspace, start a fresh session & flow
+    INTER_ITER_DELAY = 30     # seconds between workspaces
+    RATE_LIMIT_BACKOFF = 60   # extra wait on 429/401 (rate-limited password)
+    MAX_RETRIES = 3
+
+    def _is_throttled(err: str) -> bool:
+        return any(x in err for x in ("429", "password_401", "email_submit_4"))
+
+    remaining = [w for w in filtered if w.get("id") not in done_ids]
+    for i, ws in enumerate(remaining):
+        ws_name = ws.get("name") or "(unnamed)"
+
+        # Cooldown between iterations
+        _log(f"[oauth-multi] {email} - waiting {INTER_ITER_DELAY}s before iter {i + 2} (rate-limit avoidance)")
+        time.sleep(INTER_ITER_DELAY)
+
+        _log(f"[oauth-multi] {email} - iter {i + 2}/{len(filtered)} ({ws_name})")
+        _, r, new_otp = _do_one_workspace(
+            start_oauth_fn, email, password, otp_token, proxy, ws, log_fn,
+            cached_otp=cached_otp)
+
+        retry = 0
+        while not r.get("ok") and _is_throttled(str(r.get("error", ""))) and retry < MAX_RETRIES:
+            retry += 1
+            backoff = RATE_LIMIT_BACKOFF * retry  # 60, 120, 180
+            _log(f"[oauth-multi] {email} - throttled ({r.get('error','')[:80]}), sleeping {backoff}s then retry {retry}/{MAX_RETRIES}")
+            time.sleep(backoff)
+            _, r, new_otp = _do_one_workspace(
+                start_oauth_fn, email, password, otp_token, proxy, ws, log_fn,
+                cached_otp=cached_otp)
+
+        if new_otp and new_otp != cached_otp:
+            cached_otp = new_otp
+            _log(f"[oauth-multi] {email} - OTP cache updated to {cached_otp}")
+        results.append(r)
+
+    return {"ok": True, "workspaces": ws_list, "results": results, "error": None}

@@ -20,6 +20,8 @@ _ENV_MAP = {
     "oauth_client_id":      "OAUTH_CLIENT_ID",
     "oauth_redirect_uri":   "OAUTH_REDIRECT_URI",
     "output_dir":           "OUTPUT_DIR",
+    "tg_bot_token":         "TG_BOT_TOKEN",
+    "tg_allowed_users":     "TG_ALLOWED_USERS",  # comma-separated user IDs
 }
 
 
@@ -32,6 +34,8 @@ def _config_from_env() -> dict:
             continue
         if key == "domains":
             cfg[key] = [d.strip() for d in val.split(",") if d.strip()]
+        elif key == "tg_allowed_users":
+            cfg[key] = [int(x.strip()) for x in val.split(",") if x.strip()]
         else:
             cfg[key] = val
     return cfg

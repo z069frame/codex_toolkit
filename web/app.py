@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -37,7 +38,7 @@ from core import load_config
 from core.api import CPAAdmin, CPAMgmt, DataManager, decode_jwt_claims, check_deactivated
 from core.chatgpt_session import get_chatgpt_session_at, get_chatgpt_full_tokens
 from core.email_gen import generate_email, get_today_domain
-from core.openai_auth import register_account, oauth_login
+from core.openai_auth import register_account, oauth_login, oauth_login_multi
 
 LOG_FMT = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 logging.basicConfig(format=LOG_FMT, level=logging.INFO)
@@ -48,9 +49,27 @@ CFG = load_config(str(PROJECT_ROOT / "config.json"))
 OUTPUT_DIR = str(PROJECT_ROOT / CFG.get("output_dir", "output"))
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ── Auth ──
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", CFG.get("auth_password", "lishuai"))
+AUTH_COOKIE = "codex_auth"
+AUTH_TOKEN = hashlib.sha256(f"codex_{AUTH_PASSWORD}".encode()).hexdigest()[:32]
+
 # ── FastAPI ──
 app = FastAPI(title="Codex Toolkit", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    # Always allow: login endpoint, static files, index page (has login form)
+    if path in ("/", "/api/login") or path.startswith("/static/"):
+        return await call_next(request)
+    # Check auth cookie
+    if request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
 
 # ── In-memory task store ──
 tasks: dict[str, dict] = {}
@@ -144,6 +163,9 @@ class RegisterReq(BaseModel):
     domain: Optional[str] = None
     proxy: Optional[str] = None
     rt: bool = False
+    loop: bool = False
+    min_sleep: int = 30     # seconds
+    max_sleep: int = 180    # seconds
 
 
 class SingleEmailReq(BaseModel):
@@ -170,6 +192,16 @@ class HealthCheckReq(BaseModel):
 class DeactivationScanReq(BaseModel):
     dry_run: bool = False
     category: Optional[str] = None
+
+
+class LoginReq(BaseModel):
+    password: str
+
+
+class OAuthMultiReq(BaseModel):
+    email: str
+    workspace_ids: Optional[list[str]] = None  # None = all workspaces
+    proxy: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +237,10 @@ def _finish(task_id: str, result: Any, status: str = "done"):
         tasks[task_id]["finished_at"] = datetime.datetime.utcnow().isoformat() + "Z"
 
 
+def _is_stopped(task_id: str) -> bool:
+    return tasks.get(task_id, {}).get("stop_requested", False)
+
+
 # ---------------------------------------------------------------------------
 #  Shared helpers (reused from main.py logic)
 # ---------------------------------------------------------------------------
@@ -229,7 +265,77 @@ def _do_cpa_mgmt_oauth(cpa_mgmt: CPAMgmt, email: str, password: str,
 #  Background task runners
 # ---------------------------------------------------------------------------
 
+def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
+                  password, otp_token, client_id, redirect_uri, domains,
+                  proxy, fixed_email, fixed_domain, idx_label: str) -> dict:
+    """Register a single account. Shared by one-shot and loop modes."""
+    email = fixed_email or generate_email(domains, domain=fixed_domain)
+    _log(task_id, f"{idx_label} Registering {email}")
+
+    reg = register_account(email=email, password=password, otp_token=otp_token,
+                           client_id=client_id, redirect_uri=redirect_uri, proxy=proxy)
+    if not reg["ok"]:
+        _log(task_id, f"❌ {email}: {reg.get('error')}")
+        return {"email": email, "ok": False, "error": reg.get("error")}
+
+    phone_required = reg.get("phone_required", False)
+    at = reg["access_token"]
+    rt = reg["refresh_token"]
+
+    if phone_required:
+        _log(task_id, f"⚠️ {email}: phone required, trying session fallback")
+        sess = get_chatgpt_session_at(email, password, otp_token, proxy)
+        if sess["ok"]:
+            at = sess["access_token"]
+            _log(task_id, f"✅ {email}: session AT obtained (len={len(at)})")
+        else:
+            _log(task_id, f"⚠️ {email}: session failed: {sess['error']}")
+    else:
+        _log(task_id, f"✅ {email}: registered (AT={len(at)}, RT={len(rt)})")
+
+    chatgpt_rt = ""
+    if req.rt:
+        _log(task_id, f"→ {email}: getting RT via PKCE OAuth")
+        rt_res = get_chatgpt_full_tokens(email, password, otp_token, proxy)
+        if rt_res["ok"]:
+            chatgpt_rt = rt_res["refresh_token"]
+            if not at:
+                at = rt_res["access_token"]
+            _log(task_id, f"✅ {email}: RT obtained (len={len(chatgpt_rt)})")
+        else:
+            _log(task_id, f"⚠️ {email}: RT failed: {rt_res['error']}")
+
+    # Save file
+    token_file = os.path.join(OUTPUT_DIR, f"{email}.json")
+    with open(token_file, "w") as f:
+        json.dump({"email": email, "password": password, "access_token": at,
+                    "refresh_token": rt, "chatgpt_refresh_token": chatgpt_rt,
+                    "phone_required": phone_required,
+                    "created_at": datetime.datetime.utcnow().isoformat() + "Z"}, f, indent=2)
+
+    # DM
+    if at:
+        claims = decode_jwt_claims(at)
+        dm_res = dm.create_account(email, password, at, claims.get("sub", ""), token_context="free")
+    else:
+        dm_res = dm.create_account(email, password, "", "", token_context="unknown")
+    dm_ok = dm_res.get("ok", False)
+    _log(task_id, f"{'✅' if dm_ok else '⚠️'} {email}: DM {'ok' if dm_ok else 'failed'}")
+
+    # CPA OAuth
+    cpa_ok = False
+    if at:
+        cpa_res = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
+        cpa_ok = cpa_res.get("ok", False)
+        _log(task_id, f"{'✅' if cpa_ok else '⚠️'} {email}: CPA {'ok' if cpa_ok else 'failed'}")
+
+    return {"email": email, "ok": True, "phone_required": phone_required,
+            "has_at": bool(at), "dm_ok": dm_ok, "cpa_ok": cpa_ok}
+
+
 def _run_register(task_id: str, req: RegisterReq):
+    import random
+
     cfg = CFG
     proxy = _get_proxy(req.proxy)
     password = cfg["reg_password"]
@@ -243,82 +349,56 @@ def _run_register(task_id: str, req: RegisterReq):
 
     fixed_email = (req.email or "").strip() or None
     fixed_domain = (req.domain or "").strip().lstrip("@") or None
-    count = 1 if fixed_email else req.count
 
     results = []
+
+    if req.loop:
+        # ── Loop mode: register → random sleep → check stop → repeat ──
+        min_s = max(1, int(req.min_sleep or 30))
+        max_s = max(min_s, int(req.max_sleep or 180))
+        _log(task_id, f"🔁 Loop mode ON (sleep {min_s}-{max_s}s between accounts)")
+
+        i = 0
+        while not _is_stopped(task_id):
+            i += 1
+            r = _register_one(task_id, req, dm, cpa_mgmt, password, otp_token,
+                              client_id, redirect_uri, domains, proxy,
+                              None, fixed_domain, f"[loop #{i}]")
+            results.append(r)
+
+            if _is_stopped(task_id):
+                _log(task_id, "🛑 Stop requested — exiting loop")
+                break
+
+            sleep_s = random.randint(min_s, max_s)
+            _log(task_id, f"😴 Sleeping {sleep_s}s before next account...")
+            # Sleep in 1s chunks so stop is responsive
+            for _ in range(sleep_s):
+                if _is_stopped(task_id):
+                    _log(task_id, "🛑 Stop requested during sleep")
+                    break
+                import time as _time
+                _time.sleep(1)
+
+        ok_count = sum(1 for r in results if r["ok"])
+        _log(task_id, f"Loop ended: {ok_count}/{len(results)} registered over {i} iterations")
+        _finish(task_id, results, "stopped" if _is_stopped(task_id) else "done")
+        return
+
+    # ── One-shot mode ──
+    count = 1 if fixed_email else req.count
     for i in range(count):
-        email = fixed_email or generate_email(domains, domain=fixed_domain)
-        _log(task_id, f"[{i+1}/{count}] Registering {email}")
-
-        reg = register_account(email=email, password=password, otp_token=otp_token,
-                               client_id=client_id, redirect_uri=redirect_uri, proxy=proxy)
-        phone_required = False
-        at, rt = "", ""
-
-        if not reg["ok"]:
-            _log(task_id, f"❌ {email}: {reg.get('error')}")
-            results.append({"email": email, "ok": False, "error": reg.get("error")})
-            continue
-
-        phone_required = reg.get("phone_required", False)
-        at = reg["access_token"]
-        rt = reg["refresh_token"]
-
-        if phone_required:
-            _log(task_id, f"⚠️ {email}: phone required, trying session fallback")
-            sess = get_chatgpt_session_at(email, password, otp_token, proxy)
-            if sess["ok"]:
-                at = sess["access_token"]
-                _log(task_id, f"✅ {email}: session AT obtained (len={len(at)})")
-            else:
-                _log(task_id, f"⚠️ {email}: session failed: {sess['error']}")
-        else:
-            _log(task_id, f"✅ {email}: registered (AT={len(at)}, RT={len(rt)})")
-
-        # RT via Codex PKCE
-        chatgpt_rt = ""
-        if req.rt:
-            _log(task_id, f"→ {email}: getting RT via PKCE OAuth")
-            rt_res = get_chatgpt_full_tokens(email, password, otp_token, proxy)
-            if rt_res["ok"]:
-                chatgpt_rt = rt_res["refresh_token"]
-                if not at:
-                    at = rt_res["access_token"]
-                _log(task_id, f"✅ {email}: RT obtained (len={len(chatgpt_rt)})")
-            else:
-                _log(task_id, f"⚠️ {email}: RT failed: {rt_res['error']}")
-
-        # Save file
-        token_file = os.path.join(OUTPUT_DIR, f"{email}.json")
-        with open(token_file, "w") as f:
-            json.dump({"email": email, "password": password, "access_token": at,
-                        "refresh_token": rt, "chatgpt_refresh_token": chatgpt_rt,
-                        "phone_required": phone_required,
-                        "created_at": datetime.datetime.utcnow().isoformat() + "Z"}, f, indent=2)
-
-        # DM
-        dm_ok = False
-        if at:
-            claims = decode_jwt_claims(at)
-            dm_res = dm.create_account(email, password, at, claims.get("sub", ""), token_context="free")
-        else:
-            dm_res = dm.create_account(email, password, "", "", token_context="unknown")
-        dm_ok = dm_res.get("ok", False)
-        _log(task_id, f"{'✅' if dm_ok else '⚠️'} {email}: DM {'ok' if dm_ok else 'failed'}")
-
-        # CPA OAuth
-        cpa_ok = False
-        if at:
-            cpa_res = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
-            cpa_ok = cpa_res.get("ok", False)
-            _log(task_id, f"{'✅' if cpa_ok else '⚠️'} {email}: CPA {'ok' if cpa_ok else 'failed'}")
-
-        results.append({"email": email, "ok": True, "phone_required": phone_required,
-                         "has_at": bool(at), "dm_ok": dm_ok, "cpa_ok": cpa_ok})
+        if _is_stopped(task_id):
+            _log(task_id, "🛑 Stop requested")
+            break
+        r = _register_one(task_id, req, dm, cpa_mgmt, password, otp_token,
+                          client_id, redirect_uri, domains, proxy,
+                          fixed_email, fixed_domain, f"[{i+1}/{count}]")
+        results.append(r)
 
     ok_count = sum(1 for r in results if r["ok"])
     _log(task_id, f"Summary: {ok_count}/{len(results)} registered")
-    _finish(task_id, results)
+    _finish(task_id, results, "stopped" if _is_stopped(task_id) else "done")
 
 
 def _run_writeback(task_id: str, req: SingleEmailReq):
@@ -403,7 +483,7 @@ def _run_session(task_id: str, req: SingleEmailReq):
         _finish(task_id, {"ok": False, "error": "email_required"}, "error")
         return
 
-    _log(task_id, f"Getting session AT for {email}")
+    _log(task_id, f"Getting session for {email}")
     result = get_chatgpt_session_at(email, password, otp_token, proxy)
 
     if not result["ok"]:
@@ -412,19 +492,35 @@ def _run_session(task_id: str, req: SingleEmailReq):
         return
 
     at = result["access_token"]
+    session_cookie = result.get("session_cookie", "")
+    user = result.get("user", {})
+    expires = result.get("expires", "")
     claims = decode_jwt_claims(at)
     auth_info = claims.get("https://api.openai.com/auth", {})
     plan_type = auth_info.get("chatgpt_plan_type", "")
+    account_id = auth_info.get("chatgpt_account_id", "")
 
     session_file = os.path.join(OUTPUT_DIR, f"{email}.session.json")
     with open(session_file, "w") as f:
         json.dump({"email": email, "access_token": at,
-                    "session_cookie": result.get("session_cookie", ""),
+                    "session_cookie": session_cookie,
                     "plan_type": plan_type,
+                    "account_id": account_id,
+                    "user": user,
+                    "expires": expires,
                     "created_at": datetime.datetime.utcnow().isoformat() + "Z"}, f, indent=2)
 
-    _log(task_id, f"✅ AT obtained (len={len(at)}, plan={plan_type})")
-    _finish(task_id, {"ok": True, "email": email, "at_length": len(at), "plan_type": plan_type})
+    _log(task_id, f"✅ Session obtained: plan={plan_type}, AT len={len(at)}, cookie len={len(session_cookie)}")
+    _finish(task_id, {
+        "ok": True,
+        "email": email,
+        "access_token": at,
+        "session_cookie": session_cookie,
+        "plan_type": plan_type,
+        "account_id": account_id,
+        "user": user,
+        "expires": expires,
+    })
 
 
 def _run_relogin(task_id: str, req: SingleEmailReq):
@@ -560,6 +656,109 @@ def _run_oauth(task_id: str, req: SingleEmailReq):
     ok_count = sum(1 for r in results if r["ok"])
     _log(task_id, f"Summary: {ok_count}/{len(results)} succeeded")
     _finish(task_id, results)
+
+
+def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
+    """
+    OAuth all workspaces of a single account into CPAB.
+    Uses one login session to iterate through every workspace the account belongs to.
+    """
+    cfg = CFG
+    proxy = _get_proxy(req.proxy)
+    password = cfg["reg_password"]
+    otp_token = cfg["otp_token"]
+    cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"], cfg["cpa_admin_password"])
+
+    if not cpa_admin.login():
+        _log(task_id, "❌ CPA admin login failed")
+        _finish(task_id, {"ok": False, "error": "cpa_admin_login_failed"}, "error")
+        return
+
+    email = req.email.strip()
+    if not email:
+        _log(task_id, "❌ email is required")
+        _finish(task_id, {"ok": False, "error": "email_required"}, "error")
+        return
+
+    _log(task_id, f"OAuth ALL workspaces for: {email}")
+    if req.workspace_ids:
+        _log(task_id, f"Filter: {len(req.workspace_ids)} workspace(s) {req.workspace_ids}")
+
+    # start_oauth_fn returns a fresh CPAB OAuth URL+state per iteration
+    def _start():
+        return cpa_admin.start_oauth()
+
+    multi = oauth_login_multi(
+        start_oauth_fn=_start,
+        email=email,
+        password=password,
+        otp_token=otp_token,
+        proxy=proxy,
+        workspace_filter=req.workspace_ids,
+        log_fn=lambda m: _log(task_id, m),
+    )
+
+    if not multi.get("ok") and not multi.get("results"):
+        _log(task_id, f"❌ fatal: {multi.get('error')}")
+        _finish(task_id, multi, "error")
+        return
+
+    workspaces = multi.get("workspaces", [])
+    results = multi.get("results", [])
+
+    _log(task_id, f"Login ok, {len(workspaces)} workspaces, {len(results)} OAuth attempts")
+
+    # Process each successful code: send to CPAB callback + verify + set priority
+    final_results = []
+    for r in results:
+        ws_id = r.get("workspace_id", "?")
+        ws_name = r.get("workspace_name", "?")
+        ws_kind = r.get("workspace_kind", "?")
+        tag = f"{ws_name} ({ws_kind})"
+
+        if not r.get("ok") or not r.get("code"):
+            _log(task_id, f"  ⏭️ {tag}: skipped — {r.get('error', 'no code')}")
+            final_results.append({
+                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+                "ok": False, "error": r.get("error", "no_code"),
+            })
+            continue
+
+        code = r["code"]
+        state = r.get("state", "")
+        cb_resp = cpa_admin.oauth_callback(state, code)
+        if not cb_resp.get("ok"):
+            _log(task_id, f"  ❌ {tag}: callback failed: {cb_resp}")
+            final_results.append({
+                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+                "ok": False, "error": f"callback: {cb_resp}",
+            })
+            continue
+
+        _log(task_id, f"  ✅ {tag}: callback ok")
+
+        # Verify by searching CPAB for a team auth on this specific workspace
+        # find_auth_by_email picks best codex auth; may miss per-workspace details
+        # but still useful to set priority
+        auth = cpa_admin.find_auth_by_email(email)
+        if auth:
+            auth_id = auth.get("id")
+            cpa_admin.set_priority(auth_id, 100)
+            _log(task_id, f"     auth_id={auth_id} priority set")
+
+        final_results.append({
+            "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+            "ok": True,
+        })
+
+    ok_count = sum(1 for r in final_results if r["ok"])
+    _log(task_id, f"Summary: {ok_count}/{len(final_results)} workspaces OAuth'd")
+    _finish(task_id, {
+        "ok": True,
+        "email": email,
+        "workspaces": workspaces,
+        "results": final_results,
+    })
 
 
 def _run_oauth_free(task_id: str, req: OAuthFreeReq):
@@ -936,6 +1135,16 @@ async def index():
     return HTMLResponse(content=html)
 
 
+@app.post("/api/login")
+async def api_login(req: LoginReq):
+    if req.password != AUTH_PASSWORD:
+        raise HTTPException(401, "Wrong password")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(AUTH_COOKIE, AUTH_TOKEN, httponly=True,
+                    max_age=86400 * 30, samesite="lax")
+    return resp
+
+
 @app.get("/api/config")
 async def get_config():
     """Return safe subset of config for UI display."""
@@ -1055,6 +1264,13 @@ async def api_oauth_free(req: OAuthFreeReq):
     return {"task_id": task_id}
 
 
+@app.post("/api/oauth-multi")
+async def api_oauth_multi(req: OAuthMultiReq):
+    task_id = _create_task("oauth-multi", req.model_dump())
+    threading.Thread(target=_run_oauth_multi, args=(task_id, req), daemon=True).start()
+    return {"task_id": task_id}
+
+
 @app.post("/api/health-check")
 async def api_health_check(req: HealthCheckReq):
     task_id = _create_task("health-check", req.model_dump())
@@ -1075,6 +1291,15 @@ async def get_task(task_id: str):
     if not task:
         raise HTTPException(404, "Task not found")
     return task
+
+
+@app.post("/api/tasks/{task_id}/stop")
+async def stop_task(task_id: str):
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    task["stop_requested"] = True
+    return {"ok": True, "task_id": task_id}
 
 
 @app.get("/api/tasks")

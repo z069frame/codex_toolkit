@@ -95,6 +95,19 @@
   /* Domain tag */
   .domain-today { font-size: 0.7rem; color: var(--green); margin-left: 4px; }
 
+  /* Copy field */
+  .copy-field { margin-bottom: 10px; }
+  .copy-field label { display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 3px; }
+  .copy-field .copy-val { background: #0a0c10; border: 1px solid var(--border); border-radius: 6px;
+                          padding: 8px 10px; font-family: 'JetBrains Mono', 'Fira Code', monospace;
+                          font-size: 0.75rem; word-break: break-all; cursor: pointer;
+                          color: var(--text); max-height: 80px; overflow-y: auto; position: relative;
+                          transition: border-color 0.15s; }
+  .copy-field .copy-val:hover { border-color: var(--primary); }
+  .copy-field .copy-val.copied { border-color: var(--green); }
+  .copy-field .copy-val.copied::after { content: '✓ copied'; position: absolute; top: 4px; right: 8px;
+                                        color: var(--green); font-size: 0.7rem; background: var(--card); padding: 0 4px; }
+
   /* Responsive */
   @media (max-width: 640px) {
     .form-row { flex-direction: column; }
@@ -106,7 +119,18 @@
 </style>
 </head>
 <body>
-<div class="container">
+<!-- Login Overlay -->
+<div id="login-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.9); z-index:9999; align-items:center; justify-content:center;">
+  <div class="card" style="width:340px; text-align:center;">
+    <h3 style="margin-bottom:16px"><span style="color:var(--primary)">Codex</span> Toolkit</h3>
+    <input type="password" id="login-pw" placeholder="Password" style="width:100%; margin-bottom:12px; text-align:center"
+           onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Login</button>
+    <p id="login-err" style="color:var(--red); margin-top:8px; font-size:0.8rem; display:none"></p>
+  </div>
+</div>
+
+<div class="container" id="main-app" style="display:none">
   <h1><span>Codex</span> Toolkit</h1>
 
   <!-- Settings Bar -->
@@ -128,6 +152,7 @@
     <div class="tab" data-tab="relogin">Relogin</div>
     <div class="tab" data-tab="oauth">OAuth</div>
     <div class="tab" data-tab="oauth-free">OAuth-Free</div>
+    <div class="tab" data-tab="oauth-multi">OAuth Multi-WS</div>
     <div class="tab" data-tab="health">Health Check</div>
     <div class="tab" data-tab="deactivation">Deactivation Scan</div>
     <div class="tab" data-tab="tasks">Tasks</div>
@@ -167,6 +192,14 @@
         </div>
         <button class="btn btn-primary" onclick="doRegister()">Register</button>
       </div>
+      <div class="form-row" style="margin-top:8px; padding-top:12px; border-top:1px dashed var(--border)">
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="reg-loop"><label for="reg-loop" style="cursor:pointer">🔁 Loop mode</label>
+        </div>
+        <div class="form-group"><label>Min sleep (s)</label><input type="number" id="reg-min" value="30" min="1"></div>
+        <div class="form-group"><label>Max sleep (s)</label><input type="number" id="reg-max" value="180" min="1"></div>
+        <button class="btn btn-ghost btn-sm" onclick="stopRegister()" id="reg-stop-btn" style="display:none">🛑 Stop</button>
+      </div>
     </div>
     <div id="reg-log" class="card" style="display:none">
       <h3>Progress <span id="reg-status" class="badge"></span></h3>
@@ -196,11 +229,15 @@
   <!-- Session -->
   <div id="tab-session" class="panel">
     <div class="card">
-      <h3>Get ChatGPT Session AT</h3>
+      <h3>Get Full ChatGPT Session</h3>
       <div class="form-row">
         <div class="form-group"><label>Email</label><input type="text" id="sess-email" placeholder="required"></div>
         <button class="btn btn-primary" onclick="doSession()">Get Session</button>
       </div>
+    </div>
+    <div id="sess-result" class="card" style="display:none">
+      <h3>Session Result <span id="sess-r-plan" class="badge" style="margin-left:6px"></span></h3>
+      <div id="sess-r-fields"></div>
     </div>
     <div id="sess-log" class="card" style="display:none">
       <h3>Progress <span id="sess-status" class="badge"></span></h3>
@@ -265,6 +302,30 @@
     <div id="of-log" class="card" style="display:none">
       <h3>Progress <span id="of-status" class="badge"></span></h3>
       <div class="log-box" id="of-log-box"></div>
+    </div>
+  </div>
+
+  <!-- OAuth Multi-Workspace -->
+  <div id="tab-oauth-multi" class="panel">
+    <div class="card">
+      <h3>OAuth All Workspaces</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        For accounts that joined multiple workspaces: log in once, then OAuth each workspace separately into CPAB.
+        Optionally filter by specific workspace IDs (comma-separated). Leave blank to do all.
+      </p>
+      <div class="form-row">
+        <div class="form-group" style="flex:1; min-width:260px"><label>Email (required)</label>
+          <input type="text" id="om-email" placeholder="account@example.com">
+        </div>
+        <div class="form-group" style="flex:1; min-width:260px"><label>Workspace IDs (optional)</label>
+          <input type="text" id="om-ws-ids" placeholder="ws1,ws2 (leave blank for all)">
+        </div>
+        <button class="btn btn-primary" onclick="doOAuthMulti()">Start</button>
+      </div>
+    </div>
+    <div id="om-log" class="card" style="display:none">
+      <h3>Progress <span id="om-status" class="badge"></span></h3>
+      <div class="log-box" id="om-log-box"></div>
     </div>
   </div>
 
@@ -345,7 +406,7 @@ async function init() {
   }
   populateDomainDropdown();
   await loadProxy();
-  loadAccounts();
+  restoreRunningRegister();
 }
 
 function populateDomainDropdown() {
@@ -424,7 +485,6 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     tab.classList.add('active');
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
-    if (tab.dataset.tab === 'accounts') loadAccounts();
     if (tab.dataset.tab === 'tasks') loadTasks();
   });
 });
@@ -479,14 +539,28 @@ function quickSession(email) {
 }
 
 // ── Command handlers ──
+let _regTaskId = null;
+
 function doRegister() {
+  const loop = document.getElementById('reg-loop').checked;
   const body = {
     count: parseInt(document.getElementById('reg-count').value) || 1,
     email: document.getElementById('reg-email').value || null,
     domain: document.getElementById('reg-domain').value || null,
     rt: document.getElementById('reg-rt').checked,
+    loop: loop,
+    min_sleep: parseInt(document.getElementById('reg-min').value) || 30,
+    max_sleep: parseInt(document.getElementById('reg-max').value) || 180,
   };
-  submitTask('/api/register', body, 'reg');
+  if (loop) document.getElementById('reg-stop-btn').style.display = 'inline-flex';
+  submitTask('/api/register', body, 'reg', (taskId) => { _regTaskId = taskId; });
+}
+
+async function stopRegister() {
+  if (!_regTaskId) return;
+  try {
+    await fetch(API + '/api/tasks/' + _regTaskId + '/stop', {method: 'POST'});
+  } catch(e) { alert('Stop failed: ' + e.message); }
 }
 
 function doWriteback() {
@@ -524,6 +598,14 @@ function doOAuthFree() {
   }, 'of');
 }
 
+function doOAuthMulti() {
+  const email = document.getElementById('om-email').value.trim();
+  if (!email) return alert('Email is required');
+  const wsRaw = document.getElementById('om-ws-ids').value.trim();
+  const ws_ids = wsRaw ? wsRaw.split(',').map(s => s.trim()).filter(Boolean) : null;
+  submitTask('/api/oauth-multi', {email, workspace_ids: ws_ids}, 'om');
+}
+
 function doHealthCheck() {
   submitTask('/api/health-check', {
     dry_run: document.getElementById('hc-dry-run').checked,
@@ -537,8 +619,43 @@ function doDeactivationScan() {
   }, 'ds');
 }
 
-// ── Task submission + polling ──
-async function submitTask(endpoint, body, prefix) {
+// ── Task polling ──
+function pollTask(taskId, prefix) {
+  const logCard = document.getElementById(prefix + '-log');
+  const logBox = document.getElementById(prefix + '-log-box');
+  const statusBadge = document.getElementById(prefix + '-status');
+
+  logCard.style.display = 'block';
+  statusBadge.textContent = 'running';
+  statusBadge.className = 'badge badge-running';
+
+  const poll = setInterval(async () => {
+    try {
+      const tr = await fetch(API + '/api/tasks/' + taskId);
+      if (tr.status === 404) { clearInterval(poll); return; }
+      const task = await tr.json();
+      logBox.innerHTML = (task.logs || []).map(colorize).join('\n');
+      logBox.scrollTop = logBox.scrollHeight;
+
+      if (task.status !== 'running') {
+        clearInterval(poll);
+        statusBadge.textContent = task.status;
+        statusBadge.className = 'badge badge-' + (task.status === 'stopped' ? 'done' : task.status);
+        if (prefix === 'sess' && task.result && task.result.ok) {
+          renderSessionResult(task.result);
+        } else if (task.result) {
+          logBox.innerHTML += '\n\n' + colorize(JSON.stringify(task.result, null, 2));
+        }
+        if (prefix === 'reg') {
+          document.getElementById('reg-stop-btn').style.display = 'none';
+          _regTaskId = null;
+        }
+      }
+    } catch(e) { console.error(e); }
+  }, 1500);
+}
+
+async function submitTask(endpoint, body, prefix, onTaskId) {
   const logCard = document.getElementById(prefix + '-log');
   const logBox = document.getElementById(prefix + '-log-box');
   const statusBadge = document.getElementById(prefix + '-status');
@@ -556,30 +673,65 @@ async function submitTask(endpoint, body, prefix) {
     const data = await r.json();
     const taskId = data.task_id;
     if (!taskId) { logBox.textContent = 'Error: ' + JSON.stringify(data); return; }
-
-    // Poll
-    const poll = setInterval(async () => {
-      try {
-        const tr = await fetch(API + '/api/tasks/' + taskId);
-        const task = await tr.json();
-        logBox.innerHTML = (task.logs || []).map(colorize).join('\n');
-        logBox.scrollTop = logBox.scrollHeight;
-
-        if (task.status !== 'running') {
-          clearInterval(poll);
-          statusBadge.textContent = task.status;
-          statusBadge.className = 'badge badge-' + task.status;
-          if (task.result) {
-            logBox.innerHTML += '\n\n' + colorize(JSON.stringify(task.result, null, 2));
-          }
-        }
-      } catch(e) { console.error(e); }
-    }, 1500);
+    if (onTaskId) onTaskId(taskId);
+    pollTask(taskId, prefix);
   } catch(e) {
     logBox.textContent = 'Request failed: ' + e.message;
     statusBadge.textContent = 'error';
     statusBadge.className = 'badge badge-error';
   }
+}
+
+// ── Restore running register task on page load ──
+async function restoreRunningRegister() {
+  try {
+    const r = await fetch(API + '/api/tasks');
+    if (!r.ok) return;
+    const tasks = await r.json();
+    const running = tasks.find(t => t.command === 'register' && t.status === 'running');
+    if (running) {
+      _regTaskId = running.id;
+      document.getElementById('reg-stop-btn').style.display = 'inline-flex';
+      pollTask(running.id, 'reg');
+      console.log('Restored running register task:', running.id);
+    }
+  } catch(e) { console.error('restoreRunningRegister', e); }
+}
+
+// ── Session result with copy-on-click fields ──
+function renderSessionResult(r) {
+  const card = document.getElementById('sess-result');
+  const fields = document.getElementById('sess-r-fields');
+  const planBadge = document.getElementById('sess-r-plan');
+
+  card.style.display = 'block';
+  planBadge.textContent = r.plan_type || 'unknown';
+  planBadge.className = 'badge badge-' + (r.plan_type === 'team' || r.plan_type === 'enterprise' ? 'done' : 'running');
+
+  const userInfo = r.user ? JSON.stringify(r.user, null, 2) : '';
+  const items = [
+    ['Email', r.email || ''],
+    ['Account ID', r.account_id || ''],
+    ['Expires', r.expires || ''],
+    ['Access Token', r.access_token || ''],
+    ['Session Cookie', r.session_cookie || ''],
+  ];
+  if (userInfo) items.push(['User Info', userInfo]);
+
+  fields.innerHTML = items.filter(i => i[1]).map(([label, val]) => {
+    const safe = String(val).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return `<div class="copy-field">
+      <label>${label} <span style="color:var(--text-muted)">(${val.length} chars)</span></label>
+      <div class="copy-val" onclick="copyField(this, ${JSON.stringify(val).replace(/"/g,'&quot;')})">${safe}</div>
+    </div>`;
+  }).join('');
+}
+
+function copyField(el, val) {
+  navigator.clipboard.writeText(val).then(() => {
+    el.classList.add('copied');
+    setTimeout(() => el.classList.remove('copied'), 1500);
+  }).catch(e => alert('Copy failed: ' + e.message));
 }
 
 function colorize(line) {
@@ -600,13 +752,17 @@ async function loadTasks() {
     const list = document.getElementById('tasks-list');
     if (!data.length) { list.innerHTML = '<p style="color:var(--text-muted);padding:12px">No tasks yet</p>'; return; }
     list.innerHTML = data.map(t => {
-      const time = t.created_at ? new Date(t.created_at + 'Z').toLocaleTimeString() : '';
+      let time = '';
+      if (t.created_at) {
+        const d = new Date(t.created_at);
+        if (!isNaN(d)) time = d.toLocaleString();
+      }
       return `<div class="task-item" onclick="viewTask('${t.id}')">
         <div>
           <strong>${t.command}</strong>
           <span class="task-meta" style="margin-left:8px">${time}</span>
         </div>
-        <span class="badge badge-${t.status}">${t.status}</span>
+        <span class="badge badge-${t.status === 'stopped' ? 'done' : t.status}">${t.status}</span>
       </div>`;
     }).join('');
   } catch(e) { console.error(e); }
@@ -627,8 +783,48 @@ async function viewTask(taskId) {
   } catch(e) { console.error(e); }
 }
 
-// Init
-init();
+// ── Auth ──
+async function checkAuth() {
+  try {
+    const r = await fetch(API + '/api/config');
+    if (r.status === 401) return false;
+    return r.ok;
+  } catch(e) { return false; }
+}
+
+async function doLogin() {
+  const pw = document.getElementById('login-pw').value;
+  const err = document.getElementById('login-err');
+  err.style.display = 'none';
+  try {
+    const r = await fetch(API + '/api/login', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw}),
+    });
+    if (r.ok) {
+      document.getElementById('login-overlay').style.display = 'none';
+      document.getElementById('main-app').style.display = 'block';
+      init();
+    } else {
+      err.textContent = 'Wrong password';
+      err.style.display = 'block';
+    }
+  } catch(e) {
+    err.textContent = 'Connection error';
+    err.style.display = 'block';
+  }
+}
+
+// ── Startup ──
+(async function boot() {
+  if (await checkAuth()) {
+    document.getElementById('main-app').style.display = 'block';
+    init();
+  } else {
+    document.getElementById('login-overlay').style.display = 'flex';
+    document.getElementById('login-pw').focus();
+  }
+})();
 </script>
 </body>
 </html>
