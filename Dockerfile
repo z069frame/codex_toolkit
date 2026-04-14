@@ -17,5 +17,5 @@ RUN mkdir -p /app/output
 
 EXPOSE 8000
 
-# Railway injects $PORT; default to 8000 for local
-CMD uvicorn web.app:app --host 0.0.0.0 --port ${PORT:-8000}
+# Start web + bot (bot only if TG_BOT_TOKEN is set)
+CMD ["sh", "start.sh"]

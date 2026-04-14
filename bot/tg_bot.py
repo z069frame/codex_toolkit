@@ -56,11 +56,13 @@ logger = logging.getLogger("tg_bot")
 BOT_TOKEN = CFG.get("tg_bot_token") or os.environ.get("TG_BOT_TOKEN", "")
 ALLOWED_USERS: list[int] = CFG.get("tg_allowed_users", [])
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", CFG.get("auth_password", "lishuai"))
+# Owner ID: always pre-authed, no /auth needed
+OWNER_ID = 8111025282
 
 # Track per-chat running task for /stop
 _chat_tasks: dict[int, str] = {}  # chat_id → task_id
 # Authenticated user IDs (password-verified this session)
-_authed_users: set[int] = set()
+_authed_users: set[int] = {OWNER_ID}
 
 
 # ---------------------------------------------------------------------------
@@ -69,10 +71,8 @@ _authed_users: set[int] = set()
 
 def _auth_check(update: Update) -> bool:
     uid = update.effective_user.id
-    # Whitelist takes priority (if configured)
-    if ALLOWED_USERS:
-        return uid in ALLOWED_USERS
-    # Otherwise password-based auth
+    if uid == OWNER_ID:
+        return True
     return uid in _authed_users
 
 
@@ -220,6 +220,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🩺 /health [dry] — Health Check\n"
             "🔍 /deactivation [cat] — Deactivation Scan\n"
             "📨 /invite <source> <target> [role] — Invite user\n"
+            "🔴 /deact <email> [email2] — Check deactivated\n"
+            "👁 /watch on [min] | off — Deact watchdog\n"
             "🔎 /check <email> — Check account\n"
             "📊 /accounts [query] — Search accounts\n"
             "💳 /pay [email] [country] [seats] — Payment link\n"
@@ -230,23 +232,81 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /register [count] [domain]"""
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
-    count = int(args[0]) if args else 1
-    domain = args[1] if len(args) > 1 else None
+    count = 1
+    domain = None
+    for a in args:
+        if a.isdigit():
+            count = int(a)
+        elif "." in a:
+            domain = a
     req = RegisterReq(count=count, domain=domain)
     await _run_task_and_report(update, context, "register", req, _run_register)
 
 
 async def cmd_register_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /register_loop [domain] [min_sleep] [max_sleep]
+    Runs in background. Use /stop to halt.
+    """
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
-    min_s = int(args[0]) if args else 30
-    max_s = int(args[1]) if len(args) > 1 else 180
-    req = RegisterReq(count=1, loop=True, min_sleep=min_s, max_sleep=max_s)
-    await _run_task_and_report(update, context, "register", req, _run_register)
+    domain = None
+    min_s = 30
+    max_s = 180
+    nums = []
+    for a in args:
+        if "." in a and not a.isdigit():
+            domain = a
+        elif a.isdigit():
+            nums.append(int(a))
+    if len(nums) >= 2:
+        min_s, max_s = nums[0], nums[1]
+    elif len(nums) == 1:
+        min_s = nums[0]
+        max_s = max(min_s, 180)
+
+    req = RegisterReq(count=1, loop=True, domain=domain,
+                      min_sleep=min_s, max_sleep=max_s)
+    task_id = _create_task("register", req.model_dump())
+    chat_id = update.effective_chat.id
+    _chat_tasks[chat_id] = task_id
+
+    # Run in background thread — don't await, so /stop can be received
+    threading.Thread(target=_run_register, args=(task_id, req), daemon=True).start()
+
+    async def _poll_loop():
+        msg = await update.message.reply_text(
+            f"🔁 Loop register started (sleep {min_s}-{max_s}s"
+            + (f", domain={domain}" if domain else "") + ")\n"
+            f"Task: {task_id}\n"
+            f"Use /stop to halt")
+        last_text = ""
+        while True:
+            await asyncio.sleep(5)
+            task = tasks.get(task_id)
+            if not task:
+                break
+            log_lines = task["logs"][-8:]
+            status = task["status"]
+            icon = "🔁" if status == "running" else ("✅" if status == "done" else "🛑")
+            body = "\n".join(log_lines) if log_lines else "(starting...)"
+            text = f"{icon} register loop — {status}\n\n{_trim(body, 3600)}"
+            if text != last_text:
+                try:
+                    await msg.edit_text(text)
+                except Exception:
+                    pass
+                last_text = text
+            if status != "running":
+                _chat_tasks.pop(chat_id, None)
+                break
+
+    # Fire and forget the polling coroutine
+    asyncio.create_task(_poll_loop())
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -254,12 +314,20 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _denied(update)
     chat_id = update.effective_chat.id
     task_id = _chat_tasks.get(chat_id)
+
+    # Also check all running tasks if no chat-specific one
+    if not task_id:
+        running = [t for t in tasks.values() if t["status"] == "running"]
+        if running:
+            task_id = running[0]["id"]
+
     if not task_id:
         return await update.message.reply_text("No running task to stop.")
     task = tasks.get(task_id)
     if task:
         task["stop_requested"] = True
-        await update.message.reply_text(f"🛑 Stop requested for {task_id}")
+        await update.message.reply_text(
+            f"🛑 Stop requested: {task['command']} ({task_id})")
     else:
         await update.message.reply_text("Task not found.")
 
@@ -278,8 +346,13 @@ async def cmd_writeback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
-    email = args[0] if args else None
-    count = int(args[1]) if len(args) > 1 else 0
+    email = None
+    count = 0
+    for a in args:
+        if "@" in a:
+            email = a
+        elif a.isdigit():
+            count = int(a)
     req = SingleEmailReq(email=email, count=count)
     await _run_task_and_report(update, context, "writeback", req, _run_writeback)
 
@@ -288,8 +361,13 @@ async def cmd_relogin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
-    email = args[0] if args else None
-    count = int(args[1]) if len(args) > 1 else 1
+    email = None
+    count = 1
+    for a in args:
+        if "@" in a:
+            email = a
+        elif a.isdigit():
+            count = int(a)
     req = SingleEmailReq(email=email, count=count)
     await _run_task_and_report(update, context, "relogin", req, _run_relogin)
 
@@ -316,12 +394,24 @@ async def cmd_oauth_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_oauth_multi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /oauth_multi <email> [writeback]"""
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
     if not args:
-        return await update.message.reply_text("Usage: /oauth_multi <email>")
-    req = OAuthMultiReq(email=args[0])
+        return await update.message.reply_text(
+            "Usage: /oauth_multi <email> [writeback]\n"
+            "Add 'writeback' to also write AT back to DM")
+    email = None
+    writeback = False
+    for a in args:
+        if "@" in a:
+            email = a
+        elif a.lower() in ("writeback", "wb"):
+            writeback = True
+    if not email:
+        email = args[0]
+    req = OAuthMultiReq(email=email, writeback=writeback)
     await _run_task_and_report(update, context, "oauth-multi", req, _run_oauth_multi)
 
 
@@ -456,6 +546,40 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def cmd_deact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check if email(s) are deactivated by scanning inbox.
+    Usage: /deact <email> [email2] [email3] ...
+    """
+    if not _auth_check(update):
+        return await _denied(update)
+    args = context.args or []
+    if not args:
+        return await update.message.reply_text("Usage: /deact <email> [email2] ...")
+
+    otp_token = CFG.get("otp_token", "")
+    results = []
+
+    if len(args) > 1:
+        await update.message.reply_text(f"🔍 Checking {len(args)} emails...")
+
+    for email in args:
+        if "@" not in email:
+            results.append(f"⚠️ {email} — invalid email")
+            continue
+        r = check_deactivated(email, otp_token)
+        if r.get("error"):
+            results.append(f"⚠️ {email} — error: {r['error']}")
+        elif r.get("deactivated"):
+            count = r.get("matched_count", 0)
+            matches = r.get("matches", [])
+            subject = matches[0].get("subject", "")[:60] if matches else ""
+            results.append(f"🔴 {email} — DEACTIVATED ({count} match)\n   {subject}")
+        else:
+            results.append(f"🟢 {email} — OK")
+
+    await update.message.reply_text("\n".join(results))
+
+
 async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _auth_check(update):
         return await _denied(update)
@@ -506,172 +630,227 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Proxy management.
+    /proxy                          — show status
+    /proxy <url>                    — set global proxy
+    /proxy none                    — clear global proxy
+    /proxy register <url>          — set proxy for register only
+    /proxy register none           — register uses no proxy (direct)
+    /proxy register clear          — remove register override (use global)
+    """
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
+    import web.app as wa
+
+    _COMMANDS = {"register", "session", "writeback", "relogin", "oauth",
+                 "oauth-free", "oauth-multi", "health-check", "deactivation-scan"}
 
     if not args:
-        # Show current proxy
-        import web.app as wa
-        text = (f"🌐 *Proxy*\n"
-                f"Active: `{_mask_proxy(_get_proxy()) or 'none'}`\n"
-                f"Config: `{_mask_proxy(CFG.get('proxy')) or 'none'}`\n"
-                f"Override: `{_mask_proxy(wa._runtime_proxy) or 'none'}`")
-        return await update.message.reply_text(text)
+        lines = ["🌐 Proxy Settings\n",
+                 f"Global: {_mask_proxy(wa._runtime_proxy) or '(config default)'}",
+                 f"Config: {_mask_proxy(CFG.get('proxy')) or 'none'}",
+                 f"Active: {_mask_proxy(_get_proxy()) or 'none'}"]
+        if wa._task_proxies:
+            lines.append("\nPer-task overrides:")
+            for cmd, val in sorted(wa._task_proxies.items()):
+                display = "DIRECT (no proxy)" if val == wa._DIRECT else _mask_proxy(val)
+                lines.append(f"  {cmd}: {display}")
+        return await update.message.reply_text("\n".join(lines))
 
-    # Set proxy
-    import web.app as wa
+    # Check if first arg is a command name
+    if args[0].lower() in _COMMANDS:
+        cmd = args[0].lower()
+        if len(args) < 2:
+            val = wa._task_proxies.get(cmd)
+            if val:
+                display = "DIRECT (no proxy)" if val == wa._DIRECT else _mask_proxy(val)
+                return await update.message.reply_text(f"🌐 {cmd}: {display}")
+            return await update.message.reply_text(f"🌐 {cmd}: (using global)")
+
+        raw = args[1]
+        if raw.lower() == "clear":
+            wa._task_proxies.pop(cmd, None)
+            return await update.message.reply_text(f"🌐 {cmd}: override removed (using global)")
+        if raw.lower() in ("none", "direct"):
+            wa._task_proxies[cmd] = wa._DIRECT
+            return await update.message.reply_text(f"🌐 {cmd}: set to DIRECT (no proxy)")
+        parsed = _parse_proxy(raw)
+        if not parsed:
+            return await update.message.reply_text(f"❌ Invalid proxy: {raw}")
+        wa._task_proxies[cmd] = parsed
+        return await update.message.reply_text(f"🌐 {cmd}: set to {_mask_proxy(parsed)}")
+
+    # Global proxy
     raw = args[0]
     if raw.lower() in ("none", "clear", "reset"):
         wa._runtime_proxy = None
         _save_proxy(None)
-        return await update.message.reply_text("🌐 Proxy override cleared")
+        return await update.message.reply_text("🌐 Global proxy cleared")
 
     parsed = _parse_proxy(raw)
     if not parsed:
-        return await update.message.reply_text(f"❌ Invalid proxy: `{raw}`")
+        return await update.message.reply_text(f"❌ Invalid proxy: {raw}")
 
     wa._runtime_proxy = parsed
     _save_proxy(parsed)
-    await update.message.reply_text(f"🌐 Proxy set: `{_mask_proxy(parsed)}`")
+    await update.message.reply_text(f"🌐 Global proxy set: {_mask_proxy(parsed)}")
+
+
+def _pick_valid_accounts(dm: DataManager, count: int) -> tuple[list, int]:
+    """Pick up to `count` unsubscribed accounts with valid AT. Mark expired as unknown."""
+    all_accounts = dm.list_accounts()
+    candidates = []
+    for a in all_accounts:
+        tc = (a.get("token_context") or "").lower()
+        st = (a.get("status") or "").lower()
+        sub = (a.get("subscription_status") or "").lower()
+        at = a.get("access_token") or ""
+        if st not in ("active", "error"):
+            continue
+        if tc == "team":
+            continue
+        if sub in ("active", "paid", "subscribed"):
+            continue
+        if a.get("payment_link"):
+            continue
+        if not at or len(at) < 100:
+            continue
+        candidates.append(a)
+
+    candidates.sort(key=lambda x: (
+        0 if (x.get("token_context") or "").lower() == "free" else 1,
+        int(x.get("id") or 10**9),
+    ))
+
+    valid = []
+    expired = 0
+    for cand in candidates:
+        if len(valid) >= count:
+            break
+        vr = dm.verify_token(cand.get("access_token", ""))
+        if vr.get("ok"):
+            valid.append(cand)
+        else:
+            expired += 1
+            cand_id = cand.get("id")
+            tc = (cand.get("token_context") or "").lower()
+            # Only mark non-team accounts as unknown (don't downgrade team accounts)
+            if cand_id and tc != "team":
+                dm.patch_account(cand_id, {"token_context": "unknown"})
+    return valid, expired
 
 
 async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate payment link for a free account.
-    Usage: /pay [email] [country] [seats]
-    If no email: auto-pick an unsubscribed account with valid AT.
+    """Generate payment link(s).
+    /pay [country] [count]              — auto-pick N accounts
+    /pay email@x.com [country]          — specific account
+    /pay DE 3                           — 3 accounts, Germany
     """
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
 
-    # Parse flexible args: /pay [email] [country] [seats] — any order
     _COUNTRIES = {"US", "DE", "GB", "JP", "FR", "IT", "ES", "NL", "CA", "AU", "SG", "HK", "KR", "BR"}
-    email = None
+    emails = []
     country = "US"
-    seats = 5
+    count = 1
     for a in args:
         if a.upper() in _COUNTRIES:
             country = a.upper()
         elif "@" in a:
-            email = a
+            emails.append(a)
         elif a.isdigit():
-            seats = int(a)
+            count = int(a)
 
     currency = {"US": "USD", "DE": "EUR", "GB": "GBP", "JP": "JPY",
                 "FR": "EUR", "IT": "EUR", "ES": "EUR", "NL": "EUR",
                 "CA": "CAD", "AU": "AUD", "SG": "SGD", "HK": "HKD",
                 "KR": "KRW", "BR": "BRL",
                 }.get(country, "USD")
-
+    seats = 5
     dm = DataManager(CFG["dm_base"], CFG["dm_token"])
     proxy = _get_proxy()
 
-    if email:
-        # Use specified account
-        acc = dm.find_account(email)
-        if not acc:
-            return await update.message.reply_text(f"❌ {email} not found in DM")
-    else:
-        # Auto-pick: free/unknown token_context, active, no payment_link yet, has AT
-        await update.message.reply_text("🔍 Auto-picking an unsubscribed account with valid AT...")
-        all_accounts = dm.list_accounts()
-        candidates = []
-        for a in all_accounts:
-            tc = (a.get("token_context") or "").lower()
-            st = (a.get("status") or "").lower()
-            sub = (a.get("subscription_status") or "").lower()
-            at = a.get("access_token") or ""
-            if st not in ("active", "error"):
-                continue
-            if tc == "team":
-                continue  # already subscribed
-            if sub in ("active", "paid", "subscribed"):
-                continue
-            if a.get("payment_link"):
-                continue  # already has link
-            if not at or len(at) < 100:
-                continue  # no AT
-            candidates.append(a)
-
-        if not candidates:
-            return await update.message.reply_text("❌ No eligible accounts found (all subscribed or no AT)")
-
-        # Sort: prefer accounts with token_context=free over unknown
-        candidates.sort(key=lambda x: (
-            0 if (x.get("token_context") or "").lower() == "free" else 1,
-            int(x.get("id") or 10**9),
-        ))
-
-        # Try candidates until we find one with valid AT; mark expired ones
-        acc = None
-        expired_count = 0
-        checked = 0
-        for cand in candidates[:20]:
-            checked += 1
-            vr = dm.verify_token(cand.get("access_token", ""))
-            if vr.get("ok"):
-                acc = cand
-                break
+    # Build account list
+    accounts_to_process = []
+    if emails:
+        for em in emails:
+            acc = dm.find_account(em)
+            if acc:
+                accounts_to_process.append(acc)
             else:
-                # Mark as unknown so relogin/session can refresh later
-                expired_count += 1
-                cand_id = cand.get("id")
-                if cand_id:
-                    dm.patch_account(cand_id, {"token_context": "unknown"})
-
-        status_msg = f"Checked {checked} accounts"
-        if expired_count:
-            status_msg += f", {expired_count} expired (marked token_context=unknown)"
-        await update.message.reply_text(f"🔍 {status_msg}")
-
-        if not acc:
+                await update.message.reply_text(f"⚠️ {em} not found, skipping")
+    else:
+        want = max(count, 1)
+        await update.message.reply_text(f"🔍 Finding {want} account(s) with valid AT...")
+        valid, expired = _pick_valid_accounts(dm, want)
+        if expired:
+            await update.message.reply_text(f"⚠️ {expired} expired accounts marked unknown")
+        if not valid:
             return await update.message.reply_text(
-                f"❌ No account with valid AT found.\n"
-                f"Run /relogin to refresh expired accounts first.")
-
-    email = acc.get("email", "?")
-    at = acc.get("access_token", "")
-    acc_id = acc.get("id")
+                "❌ No accounts with valid AT.\nRun /relogin first.")
+        accounts_to_process = valid
 
     await update.message.reply_text(
-        f"💳 Generating payment link...\n"
-        f"Account: {email}\n"
-        f"Country: {country} ({currency})\n"
-        f"Seats: {seats}")
+        f"💳 Generating {len(accounts_to_process)} link(s) — {country} ({currency})")
 
-    result = generate_payment_link(
-        access_token=at,
-        country=country,
-        currency=currency,
-        seat_quantity=seats,
-        proxy=proxy,
-    )
+    results = []
+    for acc in accounts_to_process:
+        email = acc.get("email", "?")
+        at = acc.get("access_token", "")
+        acc_id = acc.get("id")
 
-    if not result.get("ok"):
-        return await update.message.reply_text(f"❌ Failed: {result.get('error', '?')}")
+        r = generate_payment_link(
+            access_token=at, country=country,
+            currency=currency, seat_quantity=seats, proxy=proxy)
 
-    link = result["payment_link"]
-    ws_name = result.get("workspace_name", "?")
+        if r.get("ok"):
+            link = r["payment_link"]
+            if acc_id:
+                dm.patch_account(acc_id, {
+                    "payment_link": link,
+                    "subscription_status": "pending_payment",
+                })
+            results.append(f"✅ {email}\n🔗 {link}")
+        else:
+            results.append(f"❌ {email}: {r.get('error', '?')[:80]}")
 
-    # Save link to DM
-    if acc_id:
-        dm.patch_account(acc_id, {
-            "payment_link": link,
-            "subscription_status": "pending_payment",
-        })
+    await update.message.reply_text("\n\n".join(results))
 
-    await update.message.reply_text(
-        f"✅ Payment link generated!\n\n"
-        f"Account: {email}\n"
-        f"Workspace: {ws_name}\n"
-        f"Country: {country} | Seats: {seats}\n\n"
-        f"🔗 {link}")
+
+def _resolve_account_by_input(dm: DataManager, token: str) -> dict | None:
+    """Resolve an account from email, payment link, or access token."""
+    token = token.strip()
+
+    # 1) Email
+    if "@" in token and "chatgpt.com" not in token:
+        return dm.find_account(token, include_disabled=True)
+
+    # 2) Payment link (URL containing chatgpt.com/checkout)
+    if "chatgpt.com" in token or "checkout" in token:
+        all_accs = dm.list_accounts(include_disabled=True)
+        for a in all_accs:
+            pl = a.get("payment_link") or ""
+            if pl and (token in pl or pl in token):
+                return a
+        return None
+
+    # 3) Access token / JWT — decode to find email
+    if len(token) > 100 and "." in token:
+        claims = decode_jwt_claims(token)
+        profile = claims.get("https://api.openai.com/profile", {})
+        email = profile.get("email", "")
+        if email:
+            return dm.find_account(email, include_disabled=True)
+
+    return None
 
 
 async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mark an account as subscribed after payment.
-    Usage: /mark_paid <email_or_link> [category]
+    """Mark account(s) as subscribed.
+    /mark_paid <email|link|token> [email2|link2] ... [category]
+    Supports batch: multiple emails/links/tokens in one command.
     """
     if not _auth_check(update):
         return await _denied(update)
@@ -679,65 +858,70 @@ async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not args:
         return await update.message.reply_text(
-            "Usage: /mark_paid <email_or_payment_link> [category]\n"
-            "Category: enterprise, business, plus (default: enterprise)")
+            "Usage: /mark_paid <items...> [category]\n\n"
+            "Items: email, payment link, or access token\n"
+            "Category: enterprise, business, plus (default: enterprise)\n\n"
+            "Examples:\n"
+            "/mark_paid user@x.com\n"
+            "/mark_paid user@x.com user2@y.com enterprise\n"
+            "/mark_paid https://chatgpt.com/checkout/...")
 
-    target = args[0]
-    category = args[1].lower() if len(args) > 1 else "enterprise"
+    _CATEGORIES = {"enterprise", "business", "plus", "free", "team"}
+    category = "enterprise"
+    targets = []
+    for a in args:
+        if a.lower() in _CATEGORIES:
+            category = a.lower()
+        else:
+            targets.append(a)
+
+    if not targets:
+        return await update.message.reply_text("❌ No email/link/token provided")
 
     dm = DataManager(CFG["dm_base"], CFG["dm_token"])
+    seats = 9  # actual seats after subscription
 
-    # Determine if target is email or link
-    if "@" in target:
-        acc = dm.find_account(target)
-        if not acc:
-            return await update.message.reply_text(f"❌ {target} not found in DM")
-    elif "chatgpt.com" in target or "checkout" in target:
-        # Search by payment_link
-        all_accounts = dm.list_accounts(include_disabled=True)
-        acc = None
-        for a in all_accounts:
-            pl = a.get("payment_link") or ""
-            if pl and (target in pl or pl in target):
-                acc = a
-                break
-        if not acc:
-            return await update.message.reply_text(f"❌ No account found with that payment link")
-    else:
-        return await update.message.reply_text("❌ Provide an email or payment link")
-
-    email = acc.get("email", "?")
-    acc_id = acc.get("id")
-
-    # Seats: parse from args or default 5
-    seats = 5
-    for a in args:
-        if a.isdigit():
-            seats = int(a)
-            break
+    if len(targets) > 1:
+        await update.message.reply_text(f"📝 Processing {len(targets)} item(s) as {category}...")
 
     import datetime as _dt
-    patch = {
-        "category": category,
-        "status": "active",
-        "subscription_status": "active",
-        "subscription_at": _dt.datetime.utcnow().isoformat() + "Z",
-        "seats_total": seats,
-        "seats_left": seats,
-        "token_context": "free",  # needs writeback/session to get team AT
-    }
+    results = []
+    for t in targets:
+        acc = _resolve_account_by_input(dm, t)
+        if not acc:
+            label = t if len(t) < 40 else t[:37] + "..."
+            results.append(f"❌ {label} — not found")
+            continue
 
-    result = dm.patch_account(acc_id, patch)
-    if result.get("ok"):
-        await update.message.reply_text(
-            f"✅ Marked as subscribed!\n\n"
-            f"Account: {email}\n"
-            f"Category: {category}\n"
-            f"Seats: {seats}\n"
-            f"Status: active\n"
-            f"Token context: free (run /writeback {email} to get team AT)")
-    else:
-        await update.message.reply_text(f"❌ DM patch failed: {result}")
+        email = acc.get("email", "?")
+        acc_id = acc.get("id")
+
+        fields = [
+            ("category", category),
+            ("status", "active"),
+            ("subscription_status", "active"),
+            ("subscription_at", _dt.datetime.now(_dt.timezone.utc).isoformat()),
+            ("seats_total", seats),
+            ("seats_left", seats),
+            ("token_context", "free"),
+        ]
+
+        failed = []
+        for k, v in fields:
+            for _retry in range(2):
+                r = dm.patch_account(acc_id, {k: v})
+                if r.get("ok"):
+                    break
+                import time as _t; _t.sleep(0.3)
+            else:
+                failed.append(k)
+
+        if not failed:
+            results.append(f"✅ {email} → {category} ({seats} seats)")
+        else:
+            results.append(f"⚠️ {email} → partial (failed: {', '.join(failed)})")
+
+    await update.message.reply_text("\n".join(results))
 
 
 # ---------------------------------------------------------------------------
@@ -768,6 +952,160 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = prompts.get(data, "Unknown menu item")
     await query.message.reply_text(text)
+
+
+# ---------------------------------------------------------------------------
+#  Deactivation Watchdog — periodic inbox scan + TG alert
+# ---------------------------------------------------------------------------
+
+# Track already-alerted emails to avoid spam
+_alerted_emails: set[str] = set()
+_watchdog_chat_id: int | None = None  # chat to send alerts to
+_watchdog_interval: int = 3600  # seconds (default 60 min)
+
+
+# One representative domain per worker (2 workers)
+_WATCHDOG_DOMAINS = ["zrfr.dpdns.org", "aitech.email"]
+
+def _is_deact_email(msg: dict) -> bool:
+    """Check if an email is an OpenAI deactivation notice.
+    Rule: subject contains both 'openai' and 'deactivated'."""
+    subj = (msg.get("subject") or "").lower()
+    return "deactivated" in subj and "openai" in subj
+
+
+async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job: scan global inbox (2 workers) for deactivation emails."""
+    global _alerted_emails
+    chat_id = _watchdog_chat_id
+    if not chat_id:
+        return
+
+    otp_token = CFG.get("otp_token", "")
+    new_deactivated = []
+
+    import urllib.request, json as _json
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_watchdog_interval + 60)
+
+    for domain in _WATCHDOG_DOMAINS:
+        # Fetch enough emails to cover the interval; paginate if needed
+        all_emails = []
+        page = 0
+        while True:
+            offset = page * 100
+            url = f"https://m.{domain}/api/emails?limit=100&offset={offset}"
+            headers = {"Authorization": f"Bearer {otp_token}"}
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = _json.loads(r.read())
+            except Exception as e:
+                logger.warning("Watchdog: failed to fetch %s page %d: %s", domain, page, e)
+                break
+
+            items = data if isinstance(data, list) else (data.get("items") or data.get("data") or [])
+            if not items:
+                break
+            all_emails.extend(items)
+
+            # Check if oldest email in this batch is still within interval
+            oldest_date = items[-1].get("created_at", "")
+            try:
+                oldest_dt = datetime.fromisoformat(oldest_date.replace("Z", "+00:00"))
+                if oldest_dt < cutoff:
+                    break  # reached emails older than interval
+            except Exception:
+                break
+            page += 1
+            if page > 10:  # safety limit
+                break
+
+        emails_list = all_emails
+
+        for msg in emails_list:
+            if not _is_deact_email(msg):
+                continue
+            rcpt = (msg.get("rcpt_to") or "").lower()
+            if rcpt in _alerted_emails:
+                continue
+            _alerted_emails.add(rcpt)
+            new_deactivated.append({
+                "email": rcpt,
+                "subject": msg.get("subject", "")[:60],
+                "date": msg.get("created_at", "")[:19],
+            })
+
+    if new_deactivated:
+        lines = [f"🚨 Deactivation Alert — {len(new_deactivated)} new\n"]
+        for d in new_deactivated:
+            lines.append(f"🔴 {d['email']}\n   {d['subject']}  ({d['date']})")
+        try:
+            await context.bot.send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            logger.error("Watchdog: failed to send alert: %s", e)
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Control deactivation watchdog.
+    /watch          — show status
+    /watch on [min] — start (default 5 min interval)
+    /watch off      — stop
+    """
+    if not _auth_check(update):
+        return await _denied(update)
+
+    global _watchdog_chat_id, _watchdog_interval, _alerted_emails
+    args = context.args or []
+    job_queue = context.application.job_queue
+
+    if not args:
+        # Status
+        jobs = job_queue.get_jobs_by_name("deact_watchdog")
+        if jobs:
+            await update.message.reply_text(
+                f"👁 Watchdog is ON\n"
+                f"Interval: {_watchdog_interval}s ({_watchdog_interval // 60}m)\n"
+                f"Alerted: {len(_alerted_emails)} emails\n"
+                f"Chat: {_watchdog_chat_id}")
+        else:
+            await update.message.reply_text("👁 Watchdog is OFF\n\nUse /watch on [minutes] to start")
+        return
+
+    action = args[0].lower()
+
+    if action == "on":
+        interval_min = int(args[1]) if len(args) > 1 and args[1].isdigit() else 60
+        _watchdog_interval = max(60, interval_min * 60)
+        _watchdog_chat_id = update.effective_chat.id
+
+        # Remove old jobs
+        for job in job_queue.get_jobs_by_name("deact_watchdog"):
+            job.schedule_removal()
+
+        # Schedule new
+        job_queue.run_repeating(
+            _watchdog_job,
+            interval=_watchdog_interval,
+            first=10,  # first run in 10s
+            name="deact_watchdog",
+        )
+        await update.message.reply_text(
+            f"👁 Watchdog started!\n"
+            f"Scanning every {interval_min} min\n"
+            f"Alerts will be sent to this chat")
+
+    elif action == "off":
+        for job in job_queue.get_jobs_by_name("deact_watchdog"):
+            job.schedule_removal()
+        await update.message.reply_text("👁 Watchdog stopped")
+
+    elif action == "reset":
+        _alerted_emails.clear()
+        await update.message.reply_text(f"👁 Alert history cleared — will re-check all accounts")
+
+    else:
+        await update.message.reply_text("Usage: /watch on [minutes] | off | reset")
 
 
 # ---------------------------------------------------------------------------
@@ -805,8 +1143,10 @@ def main():
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("proxy", cmd_proxy))
+    app.add_handler(CommandHandler("deact", cmd_deact))
     app.add_handler(CommandHandler("pay", cmd_pay))
     app.add_handler(CommandHandler("mark_paid", cmd_mark_paid))
+    app.add_handler(CommandHandler("watch", cmd_watch))
 
     # Inline keyboard
     app.add_handler(CallbackQueryHandler(menu_callback))
@@ -832,6 +1172,8 @@ def main():
             ("invite", "Invite: /invite <src> <target>"),
             ("accounts", "Search: /accounts [query]"),
             ("tasks", "Recent tasks"),
+            ("deact", "Check deactivated: /deact <email> ..."),
+            ("watch", "Deact watchdog: /watch on [min] | off"),
             ("pay", "Payment link: /pay [email] [country] [seats]"),
             ("mark_paid", "Mark paid: /mark_paid <email|link> [cat]"),
             ("proxy", "Proxy: /proxy [url]"),

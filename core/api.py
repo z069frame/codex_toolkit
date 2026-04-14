@@ -640,11 +640,11 @@ def generate_payment_link(
 # ---------------------------------------------------------------------------
 
 # OpenAI deactivation email indicators
-_DEACTIVATION_SENDERS = {"noreply@tm.openai.com", "noreply@openai.com"}
-_DEACTIVATION_KEYWORDS = [
-    "deactivated", "disabled", "terminated", "banned", "suspended",
-    "account has been", "violation", "policy",
-]
+def _is_deact_email(msg: dict) -> bool:
+    """Check if an email is an OpenAI deactivation notice.
+    Rule: subject contains both 'openai' and 'deactivated'."""
+    subj = (msg.get("subject") or "").lower()
+    return "deactivated" in subj and "openai" in subj
 
 
 def check_deactivated(email: str, otp_token: str) -> dict:
@@ -672,22 +672,13 @@ def check_deactivated(email: str, otp_token: str) -> dict:
 
     matches = []
     for msg in emails:
-        sender = (msg.get("mail_from") or msg.get("from") or "").lower()
-        subject = (msg.get("subject") or "").lower()
-        snippet = (msg.get("snippet") or "").lower()
-        body = (msg.get("body_text") or "").lower()
-        searchable = f"{subject} {snippet} {body}"
-
-        # Must be from OpenAI
-        if not any(s in sender for s in _DEACTIVATION_SENDERS):
+        if not _is_deact_email(msg):
             continue
-        # Must contain deactivation keywords
-        if any(kw in searchable for kw in _DEACTIVATION_KEYWORDS):
-            matches.append({
-                "subject": msg.get("subject", ""),
-                "from": msg.get("mail_from", ""),
-                "date": msg.get("created_at", ""),
-            })
+        matches.append({
+            "subject": msg.get("subject", ""),
+            "from": msg.get("mail_from", ""),
+            "date": msg.get("created_at", ""),
+        })
 
     return {
         "deactivated": len(matches) > 0,

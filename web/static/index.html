@@ -141,6 +141,30 @@
       <button class="btn btn-sm btn-primary" onclick="saveProxy()">Save</button>
       <button class="btn btn-sm btn-ghost" onclick="clearProxy()">Reset</button>
       <span id="proxy-badge" class="proxy-badge"></span>
+      <button class="btn btn-sm btn-ghost" onclick="toggleTaskProxy()">Per-Task</button>
+    </div>
+  </div>
+
+  <!-- Task Proxy Overrides -->
+  <div class="settings-bar" id="task-proxy-bar" style="display:none; flex-direction:column; align-items:stretch; gap:6px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <label style="font-size:0.8rem; color:var(--text-dim)">Per-Task Proxy Overrides</label>
+      <button class="btn btn-sm btn-ghost" onclick="toggleTaskProxy()">Close</button>
+    </div>
+    <div id="task-proxy-list" style="font-size:0.8rem; color:var(--text-dim)"></div>
+    <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+      <select id="tp-cmd" style="min-width:120px; font-size:0.8rem">
+        <option value="register">register</option>
+        <option value="session">session</option>
+        <option value="writeback">writeback</option>
+        <option value="relogin">relogin</option>
+        <option value="oauth">oauth</option>
+        <option value="oauth-free">oauth-free</option>
+        <option value="oauth-multi">oauth-multi</option>
+        <option value="pay">pay</option>
+      </select>
+      <input type="text" id="tp-proxy" placeholder="proxy url, 'none', or 'clear'" style="flex:1; min-width:180px; font-size:0.8rem">
+      <button class="btn btn-sm btn-primary" onclick="setTaskProxy()">Set</button>
     </div>
   </div>
 
@@ -155,6 +179,9 @@
     <div class="tab" data-tab="oauth-multi">OAuth Multi-WS</div>
     <div class="tab" data-tab="health">Health Check</div>
     <div class="tab" data-tab="deactivation">Deactivation Scan</div>
+    <div class="tab" data-tab="pay">Pay Link</div>
+    <div class="tab" data-tab="mark-paid">Mark Paid</div>
+    <div class="tab" data-tab="deact-check">Deact Check</div>
     <div class="tab" data-tab="tasks">Tasks</div>
   </div>
 
@@ -375,6 +402,86 @@
     <div id="ds-log" class="card" style="display:none">
       <h3>Progress <span id="ds-status" class="badge"></span></h3>
       <div class="log-box" id="ds-log-box"></div>
+    </div>
+  </div>
+
+  <!-- Pay Link -->
+  <div id="tab-pay" class="panel">
+    <div class="card">
+      <h3>Generate Payment Link</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Generate ChatGPT Team checkout link. Leave email blank to auto-pick an unsubscribed account with valid AT.
+      </p>
+      <div class="form-row">
+        <div class="form-group"><label>Email (optional)</label><input type="text" id="pay-email" placeholder="auto-pick"></div>
+        <div class="form-group"><label>Country</label>
+          <select id="pay-country">
+            <option value="US">US (USD)</option>
+            <option value="DE">DE (EUR)</option>
+            <option value="GB">GB (GBP)</option>
+            <option value="JP">JP (JPY)</option>
+            <option value="FR">FR (EUR)</option>
+            <option value="SG">SG (SGD)</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Count</label><input type="number" id="pay-count" value="1" min="1" max="20"></div>
+        <button class="btn btn-primary" onclick="doPay()">Generate</button>
+      </div>
+    </div>
+    <div id="pay-result" class="card" style="display:none">
+      <h3>Results</h3>
+      <div id="pay-result-box" class="log-box"></div>
+    </div>
+  </div>
+
+  <!-- Mark Paid -->
+  <div id="tab-mark-paid" class="panel">
+    <div class="card">
+      <h3>Mark Subscribed</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Mark accounts as subscribed. Enter emails, payment links, or access tokens (one per line).
+      </p>
+      <div class="form-row">
+        <div class="form-group" style="flex:1"><label>Emails / Links / Tokens (one per line)</label>
+          <textarea id="mp-targets" rows="4" style="width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:8px; border-radius:6px; font-size:0.85rem; font-family:monospace" placeholder="user@example.com&#10;https://chatgpt.com/checkout/...&#10;eyJhbG..."></textarea>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group"><label>Category</label>
+          <select id="mp-category">
+            <option value="enterprise">enterprise</option>
+            <option value="business">business</option>
+            <option value="plus">plus</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" onclick="doMarkPaid()">Mark Paid</button>
+      </div>
+    </div>
+    <div id="mp-result" class="card" style="display:none">
+      <h3>Results</h3>
+      <div id="mp-result-box" class="log-box"></div>
+    </div>
+  </div>
+
+  <!-- Deact Check -->
+  <div id="tab-deact-check" class="panel">
+    <div class="card">
+      <h3>Deactivation Check</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Check if accounts have been deactivated by scanning inbox for OpenAI deactivation emails.
+      </p>
+      <div class="form-row">
+        <div class="form-group" style="flex:1"><label>Emails (one per line or space-separated)</label>
+          <textarea id="dc-emails" rows="3" style="width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:8px; border-radius:6px; font-size:0.85rem; font-family:monospace" placeholder="user1@example.com&#10;user2@example.com"></textarea>
+        </div>
+      </div>
+      <div class="form-row">
+        <button class="btn btn-primary" onclick="doDeactCheck()">Check</button>
+      </div>
+    </div>
+    <div id="dc-result" class="card" style="display:none">
+      <h3>Results</h3>
+      <div id="dc-result-box" class="log-box"></div>
     </div>
   </div>
 
@@ -617,6 +724,115 @@ function doDeactivationScan() {
     dry_run: document.getElementById('ds-dry-run').checked,
     category: document.getElementById('ds-category').value || null,
   }, 'ds');
+}
+
+async function doPay() {
+  const email = document.getElementById('pay-email').value.trim() || null;
+  const country = document.getElementById('pay-country').value;
+  const count = parseInt(document.getElementById('pay-count').value) || 1;
+  const box = document.getElementById('pay-result-box');
+  const card = document.getElementById('pay-result');
+  card.style.display = 'block';
+  box.innerHTML = 'Generating...';
+  try {
+    const r = await fetch(API + '/api/pay', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email, country, count}),
+    });
+    const data = await r.json();
+    if (!r.ok) { box.innerHTML = '<span class="err">Error: ' + JSON.stringify(data) + '</span>'; return; }
+    box.innerHTML = (data.results || []).map(r => {
+      if (r.ok) return `<span class="ok">✅ ${r.email}</span>\n   <a href="${r.link}" target="_blank" style="color:var(--primary)">${r.link}</a>\n   Workspace: ${r.workspace || '?'}`;
+      return `<span class="err">❌ ${r.email}: ${r.error}</span>`;
+    }).join('\n\n');
+  } catch(e) { box.innerHTML = '<span class="err">Failed: ' + e.message + '</span>'; }
+}
+
+async function doMarkPaid() {
+  const raw = document.getElementById('mp-targets').value.trim();
+  if (!raw) return alert('Enter at least one email/link/token');
+  const targets = raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+  const category = document.getElementById('mp-category').value;
+  const box = document.getElementById('mp-result-box');
+  const card = document.getElementById('mp-result');
+  card.style.display = 'block';
+  box.innerHTML = 'Processing ' + targets.length + ' item(s)...';
+  try {
+    const r = await fetch(API + '/api/mark-paid', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({targets, category}),
+    });
+    const data = await r.json();
+    box.innerHTML = (data.results || []).map(r => {
+      if (r.ok) return `<span class="ok">✅ ${r.email} → ${category} (9 seats)</span>`;
+      const label = r.email || r.target || '?';
+      const err = r.error || (r.failed_fields || []).join(', ');
+      return `<span class="err">❌ ${label}: ${err}</span>`;
+    }).join('\n');
+  } catch(e) { box.innerHTML = '<span class="err">Failed: ' + e.message + '</span>'; }
+}
+
+// ── Task Proxy ──
+function toggleTaskProxy() {
+  const bar = document.getElementById('task-proxy-bar');
+  bar.style.display = bar.style.display === 'none' ? 'flex' : 'none';
+  if (bar.style.display === 'flex') loadTaskProxies();
+}
+
+async function loadTaskProxies() {
+  try {
+    const r = await fetch(API + '/api/proxy/tasks');
+    const data = await r.json();
+    const list = document.getElementById('task-proxy-list');
+    const tp = data.task_proxies || {};
+    const keys = Object.keys(tp);
+    if (!keys.length) { list.innerHTML = '(no overrides)'; return; }
+    list.innerHTML = keys.map(k => {
+      const v = tp[k] === 'DIRECT' ? '<span style="color:var(--yellow)">DIRECT</span>' : tp[k];
+      return `<span style="color:var(--text)">${k}</span>: ${v}`;
+    }).join('<br>');
+  } catch(e) { console.error(e); }
+}
+
+async function setTaskProxy() {
+  const cmd = document.getElementById('tp-cmd').value;
+  const proxy = document.getElementById('tp-proxy').value.trim();
+  if (!proxy) return alert('Enter proxy url, "none", or "clear"');
+  try {
+    const r = await fetch(API + '/api/proxy/tasks', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({command: cmd, proxy: proxy}),
+    });
+    const data = await r.json();
+    if (!r.ok) { alert(data.detail || 'Error'); return; }
+    document.getElementById('tp-proxy').value = '';
+    loadTaskProxies();
+  } catch(e) { alert('Failed: ' + e.message); }
+}
+
+async function doDeactCheck() {
+  const raw = document.getElementById('dc-emails').value.trim();
+  if (!raw) return alert('Enter at least one email');
+  const emails = raw.split(/[\n\s,]+/).map(s => s.trim()).filter(s => s.includes('@'));
+  const box = document.getElementById('dc-result-box');
+  const card = document.getElementById('dc-result');
+  card.style.display = 'block';
+  box.innerHTML = 'Checking ' + emails.length + ' email(s)...';
+  try {
+    const r = await fetch(API + '/api/deact-check', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({emails}),
+    });
+    const data = await r.json();
+    box.innerHTML = (data.results || []).map(r => {
+      if (r.error) return `<span class="warn">⚠️ ${r.email}: ${r.error}</span>`;
+      if (r.deactivated) {
+        const subj = (r.matches && r.matches[0]) ? r.matches[0].subject : '';
+        return `<span class="err">🔴 ${r.email} — DEACTIVATED (${r.matched_count} match)\n   ${subj}</span>`;
+      }
+      return `<span class="ok">🟢 ${r.email} — OK</span>`;
+    }).join('\n');
+  } catch(e) { box.innerHTML = '<span class="err">Failed: ' + e.message + '</span>'; }
 }
 
 // ── Task polling ──

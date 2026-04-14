@@ -140,12 +140,31 @@ def _mask_proxy(proxy: str | None) -> str | None:
     return proxy
 
 
-def _get_proxy(req_proxy: str | None = None) -> str | None:
-    """Resolve proxy: request override > runtime override > config default."""
+# Per-task proxy overrides: {"register": "socks5://...", "session": "DIRECT"}
+_task_proxies: dict[str, str] = {}
+_DIRECT = "DIRECT"  # sentinel: explicitly no proxy
+
+
+def _get_proxy(req_proxy: str | None = None, command: str | None = None) -> str | None:
+    """Resolve proxy: request > task-specific > runtime override > config default.
+    "DIRECT" or "none" at any level = explicitly no proxy."""
+    # 1) Per-request override
     if req_proxy:
+        if req_proxy.lower() in ("none", "direct"):
+            return None
         return _parse_proxy(req_proxy)
+    # 2) Per-task override
+    if command and command in _task_proxies:
+        val = _task_proxies[command]
+        if val == _DIRECT:
+            return None
+        return val
+    # 3) Runtime override
     if _runtime_proxy is not None:
+        if _runtime_proxy == _DIRECT:
+            return None
         return _runtime_proxy
+    # 4) Config default
     return CFG.get("proxy")
 
 
@@ -202,6 +221,28 @@ class OAuthMultiReq(BaseModel):
     email: str
     workspace_ids: Optional[list[str]] = None  # None = all workspaces
     proxy: Optional[str] = None
+    writeback: bool = False  # also write AT back to DM
+
+
+class PayReq(BaseModel):
+    email: Optional[str] = None
+    country: str = "US"
+    count: int = 1
+    proxy: Optional[str] = None
+
+
+class MarkPaidReq(BaseModel):
+    targets: list[str]  # emails, links, or tokens
+    category: str = "enterprise"
+
+
+class DeactCheckReq(BaseModel):
+    emails: list[str]
+
+
+class TaskProxyReq(BaseModel):
+    command: str
+    proxy: str  # url or "none" or "clear"
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +378,7 @@ def _run_register(task_id: str, req: RegisterReq):
     import random
 
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "register")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     client_id = cfg["oauth_client_id"]
@@ -403,7 +444,7 @@ def _run_register(task_id: str, req: RegisterReq):
 
 def _run_writeback(task_id: str, req: SingleEmailReq):
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "writeback")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
@@ -473,7 +514,7 @@ def _run_writeback(task_id: str, req: SingleEmailReq):
 
 def _run_session(task_id: str, req: SingleEmailReq):
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "session")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
 
@@ -525,7 +566,7 @@ def _run_session(task_id: str, req: SingleEmailReq):
 
 def _run_relogin(task_id: str, req: SingleEmailReq):
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "relogin")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
@@ -576,7 +617,7 @@ def _run_relogin(task_id: str, req: SingleEmailReq):
 
 def _run_oauth(task_id: str, req: SingleEmailReq):
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "oauth")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
@@ -664,7 +705,7 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
     Uses one login session to iterate through every workspace the account belongs to.
     """
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "oauth-multi")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"], cfg["cpa_admin_password"])
@@ -737,18 +778,63 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
 
         _log(task_id, f"  ✅ {tag}: callback ok")
 
-        # Verify by searching CPAB for a team auth on this specific workspace
-        # find_auth_by_email picks best codex auth; may miss per-workspace details
-        # but still useful to set priority
+        # Verify CPAB auth and set priority
         auth = cpa_admin.find_auth_by_email(email)
+        dm_written = False
         if auth:
             auth_id = auth.get("id")
             cpa_admin.set_priority(auth_id, 100)
             _log(task_id, f"     auth_id={auth_id} priority set")
 
+        # DM writeback (only if --writeback requested)
+        if req.writeback and auth:
+            cpab_at = None
+            fresh_files = cpa_admin.list_auth_files()
+            for ff in fresh_files:
+                fc = ff.get("content") or {}
+                if isinstance(fc, str):
+                    try:
+                        fc = json.loads(fc)
+                    except Exception:
+                        continue
+                if (fc.get("email") or "").lower() != email.lower():
+                    continue
+                if "codex" not in (fc.get("type") or "").lower():
+                    continue
+                ff_at = fc.get("access_token", "")
+                if not ff_at or len(ff_at) < 100:
+                    continue
+                ff_claims = decode_jwt_claims(ff_at)
+                ff_aid = ff_claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id", "")
+                if ff_aid == ws_id:
+                    cpab_at = ff_at
+                    break
+
+            if cpab_at:
+                claims = decode_jwt_claims(cpab_at)
+                auth_info = claims.get("https://api.openai.com/auth", {})
+                plan_type = auth_info.get("chatgpt_plan_type", "")
+                account_id = auth_info.get("chatgpt_account_id", "")
+                new_tc = "team" if plan_type in ("team", "enterprise", "business") else "free"
+
+                dm = DataManager(cfg["dm_base"], cfg["dm_token"])
+                dm_acc = dm.find_account(email)
+                if dm_acc:
+                    patch_body = {"access_token": cpab_at, "token_context": new_tc}
+                    if account_id:
+                        patch_body["team_account_id"] = account_id
+                    pr = dm.patch_account(dm_acc["id"], patch_body)
+                    dm_written = pr.get("ok", False)
+                    if dm_written:
+                        _log(task_id, f"     DM writeback: tc={new_tc}, plan={plan_type}, ws={account_id}")
+                    else:
+                        _log(task_id, f"     ⚠️ DM writeback failed")
+            else:
+                _log(task_id, f"     ⚠️ CPAB AT for workspace {ws_id} not found")
+
         final_results.append({
             "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
-            "ok": True,
+            "ok": True, "dm_written": dm_written,
         })
 
     ok_count = sum(1 for r in final_results if r["ok"])
@@ -763,7 +849,7 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
 
 def _run_oauth_free(task_id: str, req: OAuthFreeReq):
     cfg = CFG
-    proxy = _get_proxy(req.proxy)
+    proxy = _get_proxy(req.proxy, "oauth-free")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     cpa_mgmt = CPAMgmt(cfg["cpa_mgmt_base"], cfg["cpa_mgmt_bearer"])
@@ -1283,6 +1369,146 @@ async def api_deactivation_scan(req: DeactivationScanReq):
     task_id = _create_task("deactivation-scan", req.model_dump())
     threading.Thread(target=_run_deactivation_scan, args=(task_id, req), daemon=True).start()
     return {"task_id": task_id}
+
+
+@app.post("/api/pay")
+async def api_pay(req: PayReq):
+    """Generate payment link(s). If no email, auto-pick."""
+    from core.api import generate_payment_link as _gen_pay
+    dm = DataManager(CFG["dm_base"], CFG["dm_token"])
+    proxy = _get_proxy(req.proxy, "pay")
+    currency_map = {"US": "USD", "DE": "EUR", "GB": "GBP", "JP": "JPY",
+                    "FR": "EUR", "IT": "EUR", "ES": "EUR", "NL": "EUR",
+                    "CA": "CAD", "AU": "AUD", "SG": "SGD"}
+    currency = currency_map.get(req.country.upper(), "USD")
+
+    accounts = []
+    if req.email:
+        acc = dm.find_account(req.email)
+        if not acc:
+            raise HTTPException(404, f"{req.email} not found")
+        accounts = [acc]
+    else:
+        all_accs = dm.list_accounts()
+        candidates = [a for a in all_accs
+                      if (a.get("token_context") or "").lower() != "team"
+                      and (a.get("status") or "").lower() in ("active", "error")
+                      and not a.get("payment_link")
+                      and len(a.get("access_token") or "") > 100]
+        candidates.sort(key=lambda x: (
+            0 if (x.get("token_context") or "").lower() == "free" else 1,
+            int(x.get("id") or 10**9)))
+        for c in candidates[:req.count * 3]:
+            if len(accounts) >= req.count:
+                break
+            vr = dm.verify_token(c.get("access_token", ""))
+            if vr.get("ok"):
+                accounts.append(c)
+            else:
+                tc = (c.get("token_context") or "").lower()
+                if tc != "team" and c.get("id"):
+                    dm.patch_account(c["id"], {"token_context": "unknown"})
+
+    results = []
+    for acc in accounts:
+        r = _gen_pay(access_token=acc.get("access_token", ""),
+                     country=req.country.upper(), currency=currency,
+                     seat_quantity=5, proxy=proxy)
+        email = acc.get("email", "?")
+        if r.get("ok"):
+            if acc.get("id"):
+                dm.patch_account(acc["id"], {"payment_link": r["payment_link"],
+                                             "subscription_status": "pending_payment"})
+            results.append({"email": email, "ok": True, "link": r["payment_link"],
+                           "workspace": r.get("workspace_name")})
+        else:
+            results.append({"email": email, "ok": False, "error": r.get("error")})
+    return {"results": results}
+
+
+@app.post("/api/mark-paid")
+async def api_mark_paid(req: MarkPaidReq):
+    """Mark accounts as subscribed. Accepts emails, payment links, or tokens."""
+    dm = DataManager(CFG["dm_base"], CFG["dm_token"])
+    import datetime as _dt
+    results = []
+    for t in req.targets:
+        t = t.strip()
+        acc = None
+        if "@" in t and "chatgpt.com" not in t:
+            acc = dm.find_account(t, include_disabled=True)
+        elif "chatgpt.com" in t or "checkout" in t:
+            for a in dm.list_accounts(include_disabled=True):
+                pl = a.get("payment_link") or ""
+                if pl and (t in pl or pl in t):
+                    acc = a
+                    break
+        elif len(t) > 100 and "." in t:
+            claims = decode_jwt_claims(t)
+            email = claims.get("https://api.openai.com/profile", {}).get("email", "")
+            if email:
+                acc = dm.find_account(email, include_disabled=True)
+
+        if not acc:
+            results.append({"target": t[:40], "ok": False, "error": "not_found"})
+            continue
+
+        fields = [("category", req.category), ("status", "active"),
+                  ("subscription_status", "active"),
+                  ("subscription_at", _dt.datetime.now(_dt.timezone.utc).isoformat()),
+                  ("seats_total", 9), ("seats_left", 9), ("token_context", "free")]
+        failed = []
+        for k, v in fields:
+            for _ in range(2):
+                r = dm.patch_account(acc["id"], {k: v})
+                if r.get("ok"):
+                    break
+                import time; time.sleep(0.3)
+            else:
+                failed.append(k)
+        results.append({"email": acc.get("email"), "ok": not failed,
+                       "failed_fields": failed or None})
+    return {"results": results}
+
+
+@app.post("/api/deact-check")
+async def api_deact_check(req: DeactCheckReq):
+    """Check emails for deactivation."""
+    otp_token = CFG.get("otp_token", "")
+    results = []
+    for email in req.emails:
+        r = check_deactivated(email, otp_token)
+        results.append({
+            "email": email,
+            "deactivated": r.get("deactivated", False),
+            "matched_count": r.get("matched_count", 0),
+            "matches": r.get("matches", []),
+            "error": r.get("error"),
+        })
+    return {"results": results}
+
+
+@app.get("/api/proxy/tasks")
+async def get_task_proxies():
+    return {"task_proxies": {k: _mask_proxy(v) if v != _DIRECT else "DIRECT"
+                             for k, v in _task_proxies.items()}}
+
+
+@app.put("/api/proxy/tasks")
+async def set_task_proxy(req: TaskProxyReq):
+    cmd = req.command.lower()
+    raw = req.proxy.strip()
+    if raw.lower() == "clear":
+        _task_proxies.pop(cmd, None)
+        return {"ok": True, "command": cmd, "proxy": None}
+    if raw.lower() in ("none", "direct"):
+        _task_proxies[cmd] = _DIRECT
+        return {"ok": True, "command": cmd, "proxy": "DIRECT"}
+    parsed = _parse_proxy(raw)
+    if not parsed:
+        raise HTTPException(400, f"Invalid proxy: {raw}")
+    _task_proxies[cmd] = parsed
+    return {"ok": True, "command": cmd, "proxy": _mask_proxy(parsed)}
 
 
 @app.get("/api/tasks/{task_id}")
