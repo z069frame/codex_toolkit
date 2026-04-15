@@ -152,6 +152,9 @@ async def _run_task_and_report(
         await update.message.reply_text(at)
         if cookie:
             await update.message.reply_text(f"Session Cookie:\n{cookie}")
+        # Send full JSON
+        full_json = json.dumps(result, indent=2, ensure_ascii=False)
+        await update.message.reply_text(f"Full JSON:\n{_trim(full_json, 3900)}")
     elif result:
         result_text = json.dumps(result, indent=2, ensure_ascii=False)
         await update.message.reply_text(f"📋 Result:\n{_trim(result_text, 3900)}")
