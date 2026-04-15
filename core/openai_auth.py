@@ -385,8 +385,29 @@ def register_account(
         if r.status_code != 200:
             return {"ok": False, "error": f"otp_validate_{r.status_code}"}
 
-        # 8) Create account (new only)
-        if not is_existing:
+        # 8) Handle add_phone (may appear after OTP for new accounts)
+        resp = _safe_json(r)
+        page_type = (resp.get("page") or {}).get("type", "")
+
+        if page_type == "add_phone":
+            logger.info("[register] %s - phone step, trying to skip", email)
+            r = session.post(PHONE_SKIP_URL, headers=hdrs, timeout=30)
+            if r.status_code == 200:
+                resp = _safe_json(r)
+                page_type = (resp.get("page") or {}).get("type", "")
+                logger.info("[register] %s - phone skip OK, page=%s", email, page_type)
+            else:
+                logger.warning("[register] %s - phone skip failed (HTTP %d), account created without tokens",
+                               email, r.status_code)
+                return {
+                    "ok": True,
+                    "access_token": "",
+                    "refresh_token": "",
+                    "phone_required": True,
+                }
+
+        # 9) Create account profile (new only)
+        if not is_existing and page_type in ("create_account", "about_you", ""):
             logger.info("[register] %s - creating account profile", email)
             r = session.post(CREATE_URL, headers=hdrs,
                              data=json.dumps({"name": random_display_name(),
@@ -394,11 +415,11 @@ def register_account(
                              timeout=30)
             if r.status_code != 200:
                 return {"ok": False, "error": f"create_account_{r.status_code}: {r.text[:200]}"}
+            resp = _safe_json(r)
+            page_type = (resp.get("page") or {}).get("type", "")
 
         # === Phase 2: Token exchange (reuse original PKCE, no re-login) ===
-        resp = _safe_json(r)
         continue_url = resp.get("continue_url", "")
-        page_type = (resp.get("page") or {}).get("type", "")
         logger.info("[register] %s - after create: page=%s, continue_url=%s",
                      email, page_type, continue_url[:120] if continue_url else "(none)")
 
@@ -408,8 +429,7 @@ def register_account(
             "code_verifier": code_verifier,
         }
 
-        # Handle add_phone: account created but Codex OAuth blocked.
-        # Return partial success — caller will try alternative AT methods.
+        # Still phone-blocked after skip attempt
         if page_type == "add_phone":
             logger.warning("[register] %s - phone required, account created without tokens", email)
             return {
