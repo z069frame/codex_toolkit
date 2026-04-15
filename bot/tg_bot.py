@@ -139,22 +139,8 @@ async def _run_task_and_report(
     task = tasks.get(task_id, {})
     result = task.get("result")
     if result and command == "session" and isinstance(result, dict) and result.get("ok"):
-        at = result.get("access_token", "")
-        cookie = result.get("session_cookie", "")
-        plan = result.get("plan_type", "?")
-        email = result.get("email", "?")
-        summary = (f"🔑 Session for {email}\n"
-                   f"Plan: {plan}\n"
-                   f"AT: {len(at)} chars\n"
-                   f"Cookie: {len(cookie)} chars")
-        await update.message.reply_text(summary)
-        # Send full AT as plain text for easy copy
-        await update.message.reply_text(at)
-        if cookie:
-            await update.message.reply_text(f"Session Cookie:\n{cookie}")
-        # Send full JSON
         full_json = json.dumps(result, indent=2, ensure_ascii=False)
-        await update.message.reply_text(f"Full JSON:\n{_trim(full_json, 3900)}")
+        await update.message.reply_text(_trim(full_json, 4000))
     elif result:
         result_text = json.dumps(result, indent=2, ensure_ascii=False)
         await update.message.reply_text(f"📋 Result:\n{_trim(result_text, 3900)}")

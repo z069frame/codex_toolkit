@@ -924,25 +924,12 @@ function renderSessionResult(r) {
   planBadge.textContent = r.plan_type || 'unknown';
   planBadge.className = 'badge badge-' + (r.plan_type === 'team' || r.plan_type === 'enterprise' ? 'done' : 'running');
 
-  const userInfo = r.user ? JSON.stringify(r.user, null, 2) : '';
   const fullJson = JSON.stringify(r, null, 2);
-  const items = [
-    ['Email', r.email || ''],
-    ['Account ID', r.account_id || ''],
-    ['Expires', r.expires || ''],
-    ['Access Token', r.access_token || ''],
-    ['Session Cookie', r.session_cookie || ''],
-  ];
-  if (userInfo) items.push(['User Info', userInfo]);
-  items.push(['Full JSON', fullJson]);
-
-  fields.innerHTML = items.filter(i => i[1]).map(([label, val]) => {
-    const safe = String(val).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    return `<div class="copy-field">
-      <label>${label} <span style="color:var(--text-muted)">(${val.length} chars)</span></label>
-      <div class="copy-val" onclick="copyField(this, ${JSON.stringify(val).replace(/"/g,'&quot;')})">${safe}</div>
-    </div>`;
-  }).join('');
+  const safe = fullJson.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  fields.innerHTML = `<div class="copy-field">
+    <label>Session JSON <span style="color:var(--text-muted)">(click to copy)</span></label>
+    <div class="copy-val" style="max-height:500px" onclick="copyField(this, ${JSON.stringify(fullJson).replace(/"/g,'&quot;')})">${safe}</div>
+  </div>`;
 }
 
 function copyField(el, val) {
