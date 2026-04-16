@@ -1037,9 +1037,13 @@ def _verify_team_ats(dm: DataManager) -> dict:
 
     for acc in accounts:
         tc = (acc.get("token_context") or "").lower()
+        st = (acc.get("status") or "").lower()
         at = acc.get("access_token") or ""
         email = (acc.get("email") or "").lower()
-        if tc != "team" or not at or len(at) < 100:
+        # Only check active/error team accounts with valid AT
+        if tc != "team" or st not in ("active", "error"):
+            continue
+        if not at or len(at) < 100:
             continue
 
         try:
@@ -1088,16 +1092,21 @@ def _verify_team_ats(dm: DataManager) -> dict:
 async def _handle_deactivated(dm: DataManager, email: str) -> dict:
     """Auto-disable a deactivated account in DM and delete from CPAB."""
     acc = dm.find_account(email, include_disabled=True)
-    result = {"dm_disabled": False, "cpab_deleted": 0, "error": None}
+    result = {"dm_disabled": False, "cpab_deleted": 0, "error": None,
+              "already_disabled": False}
     if not acc:
         result["error"] = "not_in_dm"
         return result
 
-    try:
-        pr = dm.patch_account(acc["id"], {"status": "disabled"})
-        result["dm_disabled"] = pr.get("ok", False)
-    except Exception as e:
-        result["error"] = f"dm_patch: {e}"
+    # Skip if already disabled
+    if (acc.get("status") or "").lower() == "disabled":
+        result["already_disabled"] = True
+    else:
+        try:
+            pr = dm.patch_account(acc["id"], {"status": "disabled"})
+            result["dm_disabled"] = pr.get("ok", False)
+        except Exception as e:
+            result["error"] = f"dm_patch: {e}"
 
     try:
         cpa = CPAAdmin(CFG["cpa_admin_base"], CFG["cpa_admin_user"],
@@ -1129,14 +1138,19 @@ async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE):
     action_lines = []
     for d in new_deact:
         actions = await _handle_deactivated(dm, d["email"])
+        # Skip notification if already disabled (nothing new to report)
+        if actions.get("already_disabled") and actions["cpab_deleted"] == 0:
+            continue
         tag = []
         if actions["dm_disabled"]:
             tag.append("DM disabled")
+        elif actions.get("already_disabled"):
+            tag.append("already disabled")
         if actions["cpab_deleted"]:
             tag.append(f"CPAB -{actions['cpab_deleted']}")
         if actions["error"]:
             tag.append(f"err: {actions['error']}")
-        if not actions["dm_disabled"] and not actions["cpab_deleted"]:
+        if not tag:
             tag.append("not found")
         action_lines.append(f"🔴 {d['email']}  [{', '.join(tag)}]\n   {d['subject']}")
 
