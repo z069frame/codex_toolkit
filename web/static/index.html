@@ -171,19 +171,26 @@
   <div class="tabs">
     <div class="tab active" data-tab="accounts">Accounts</div>
     <div class="tab" data-tab="register">Register</div>
-    <div class="tab" data-tab="writeback">Writeback</div>
     <div class="tab" data-tab="session">Session</div>
+    <div class="tab" data-tab="writeback">Writeback</div>
     <div class="tab" data-tab="relogin">Relogin</div>
     <div class="tab" data-tab="oauth">OAuth</div>
-    <div class="tab" data-tab="oauth-free">OAuth-Free</div>
-    <div class="tab" data-tab="oauth-multi">OAuth Multi-WS</div>
-    <div class="tab" data-tab="health">Health Check</div>
-    <div class="tab" data-tab="deactivation">Deactivation Scan</div>
     <div class="tab" data-tab="pay">Pay Link</div>
-    <div class="tab" data-tab="mark-paid">Mark Paid</div>
+    <div class="tab" data-tab="subscribe">Subscribe</div>
+    <div class="tab" data-tab="invite">Invite</div>
+    <div class="tab" data-tab="monitoring">Monitoring</div>
     <div class="tab" data-tab="deact-check">Deact Check</div>
     <div class="tab" data-tab="tasks">Tasks</div>
   </div>
+
+  <style>
+    .seg-ctl { display:flex; gap:4px; margin-bottom:16px; padding:3px; background:var(--bg); border-radius:8px; width:fit-content; }
+    .seg-btn { padding:6px 14px; background:transparent; border:none; color:var(--text-dim); cursor:pointer; border-radius:6px; font-size:0.85rem; }
+    .seg-btn.active { background:var(--primary); color:white; }
+    .seg-btn:not(.active):hover { background:var(--border); color:var(--text); }
+    .seg-panel { display:none; }
+    .seg-panel.active { display:block; }
+  </style>
 
   <!-- Accounts -->
   <div id="tab-accounts" class="panel active">
@@ -290,118 +297,148 @@
 
   <!-- OAuth -->
   <div id="tab-oauth" class="panel">
-    <div class="card">
-      <h3>CPA OAuth (team -> CPA-B)</h3>
-      <div class="form-row">
-        <div class="form-group"><label>Email (optional)</label><input type="text" id="oa-email" placeholder="auto pick"></div>
-        <div class="form-group"><label>Count (0=all)</label><input type="number" id="oa-count" value="0" min="0"></div>
-        <button class="btn btn-primary" onclick="doOAuth()">Start OAuth</button>
+    <div class="seg-ctl">
+      <button class="seg-btn active" data-oauth-mode="team" onclick="setOAuthMode('team')">Team (CPAB)</button>
+      <button class="seg-btn" data-oauth-mode="free" onclick="setOAuthMode('free')">Free (CPAMgmt)</button>
+      <button class="seg-btn" data-oauth-mode="multi" onclick="setOAuthMode('multi')">Multi-Workspace</button>
+    </div>
+
+    <!-- Team mode -->
+    <div id="oauth-team" class="seg-panel active">
+      <div class="card">
+        <h3>CPA OAuth (team → CPA-B)</h3>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">Single-workspace OAuth for team/business/plus accounts into CPAB.</p>
+        <div class="form-row">
+          <div class="form-group"><label>Email (optional)</label><input type="text" id="oa-email" placeholder="auto pick"></div>
+          <div class="form-group"><label>Count (0=all)</label><input type="number" id="oa-count" value="0" min="0"></div>
+          <button class="btn btn-primary" onclick="doOAuth()">Start OAuth</button>
+        </div>
+      </div>
+      <div id="oa-log" class="card" style="display:none">
+        <h3>Progress <span id="oa-status" class="badge"></span></h3>
+        <div class="log-box" id="oa-log-box"></div>
       </div>
     </div>
-    <div id="oa-log" class="card" style="display:none">
-      <h3>Progress <span id="oa-status" class="badge"></span></h3>
-      <div class="log-box" id="oa-log-box"></div>
+
+    <!-- Free mode -->
+    <div id="oauth-free" class="seg-panel">
+      <div class="card">
+        <h3>OAuth-Free (DM accounts → free CPA)</h3>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+          OAuth non-deactivated DM accounts into free CPA. Skips accounts already in CPA.
+        </p>
+        <div class="form-row">
+          <div class="form-group"><label>Email (optional)</label><input type="text" id="of-email" placeholder="all candidates"></div>
+          <div class="form-group"><label>Count (0=all)</label><input type="number" id="of-count" value="0" min="0"></div>
+          <div class="form-group"><label>Category</label>
+            <select id="of-category">
+              <option value="">All</option>
+              <option value="enterprise">enterprise</option>
+              <option value="business">business</option>
+              <option value="plus">plus</option>
+              <option value="free">free</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" onclick="doOAuthFree()">Start OAuth-Free</button>
+        </div>
+      </div>
+      <div id="of-log" class="card" style="display:none">
+        <h3>Progress <span id="of-status" class="badge"></span></h3>
+        <div class="log-box" id="of-log-box"></div>
+      </div>
+    </div>
+
+    <!-- Multi-Workspace mode -->
+    <div id="oauth-multi" class="seg-panel">
+      <div class="card">
+        <h3>OAuth All Workspaces</h3>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+          For accounts that joined multiple workspaces: log in once, then OAuth each workspace separately into CPAB.
+          Optionally filter by specific workspace IDs (comma-separated). Leave blank to do all.
+        </p>
+        <div class="form-row">
+          <div class="form-group" style="flex:1; min-width:260px"><label>Email (required)</label>
+            <input type="text" id="om-email" placeholder="account@example.com">
+          </div>
+          <div class="form-group" style="flex:1; min-width:260px"><label>Workspace IDs (optional)</label>
+            <input type="text" id="om-ws-ids" placeholder="ws1,ws2 (leave blank for all)">
+          </div>
+          <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+            <input type="checkbox" id="om-writeback"><label for="om-writeback" style="cursor:pointer">DM Writeback</label>
+          </div>
+          <button class="btn btn-primary" onclick="doOAuthMulti()">Start</button>
+        </div>
+      </div>
+      <div id="om-log" class="card" style="display:none">
+        <h3>Progress <span id="om-status" class="badge"></span></h3>
+        <div class="log-box" id="om-log-box"></div>
+      </div>
     </div>
   </div>
 
-  <!-- OAuth-Free -->
-  <div id="tab-oauth-free" class="panel">
-    <div class="card">
-      <h3>OAuth-Free (DM accounts -> free CPA)</h3>
-      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
-        OAuth non-deactivated DM accounts into free CPA. Skips accounts already in CPA.
-      </p>
-      <div class="form-row">
-        <div class="form-group"><label>Email (optional)</label><input type="text" id="of-email" placeholder="all candidates"></div>
-        <div class="form-group"><label>Count (0=all)</label><input type="number" id="of-count" value="0" min="0"></div>
-        <div class="form-group"><label>Category</label>
-          <select id="of-category">
-            <option value="">All</option>
-            <option value="enterprise">enterprise</option>
-            <option value="business">business</option>
-            <option value="plus">plus</option>
-            <option value="free">free</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" onclick="doOAuthFree()">Start OAuth-Free</button>
-      </div>
+  <!-- Monitoring (Health Check + Deactivation Scan + Watchdog status) -->
+  <div id="tab-monitoring" class="panel">
+    <div class="seg-ctl">
+      <button class="seg-btn active" data-mon-mode="health" onclick="setMonMode('health')">Health Check</button>
+      <button class="seg-btn" data-mon-mode="deact" onclick="setMonMode('deact')">Deactivation Scan</button>
+      <button class="seg-btn" data-mon-mode="watchdog" onclick="setMonMode('watchdog')">Watchdog</button>
     </div>
-    <div id="of-log" class="card" style="display:none">
-      <h3>Progress <span id="of-status" class="badge"></span></h3>
-      <div class="log-box" id="of-log-box"></div>
-    </div>
-  </div>
 
-  <!-- OAuth Multi-Workspace -->
-  <div id="tab-oauth-multi" class="panel">
-    <div class="card">
-      <h3>OAuth All Workspaces</h3>
-      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
-        For accounts that joined multiple workspaces: log in once, then OAuth each workspace separately into CPAB.
-        Optionally filter by specific workspace IDs (comma-separated). Leave blank to do all.
-      </p>
-      <div class="form-row">
-        <div class="form-group" style="flex:1; min-width:260px"><label>Email (required)</label>
-          <input type="text" id="om-email" placeholder="account@example.com">
+    <div id="mon-health" class="seg-panel active">
+      <div class="card">
+        <h3>CPAB Health Check</h3>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+          Verify all codex auth-files in CPAB via DM token/verify. Expired or deactivated entries are auto-deleted.
+        </p>
+        <div class="form-row">
+          <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+            <input type="checkbox" id="hc-dry-run"><label for="hc-dry-run" style="cursor:pointer">Dry Run (check only, no delete)</label>
+          </div>
+          <button class="btn btn-primary" onclick="doHealthCheck()">Run Health Check</button>
         </div>
-        <div class="form-group" style="flex:1; min-width:260px"><label>Workspace IDs (optional)</label>
-          <input type="text" id="om-ws-ids" placeholder="ws1,ws2 (leave blank for all)">
-        </div>
-        <button class="btn btn-primary" onclick="doOAuthMulti()">Start</button>
+      </div>
+      <div id="hc-log" class="card" style="display:none">
+        <h3>Progress <span id="hc-status" class="badge"></span></h3>
+        <div class="log-box" id="hc-log-box"></div>
       </div>
     </div>
-    <div id="om-log" class="card" style="display:none">
-      <h3>Progress <span id="om-status" class="badge"></span></h3>
-      <div class="log-box" id="om-log-box"></div>
-    </div>
-  </div>
 
-  <!-- Health Check -->
-  <div id="tab-health" class="panel">
-    <div class="card">
-      <h3>CPAB Health Check</h3>
-      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
-        Verify all codex auth-files in CPAB via DM token/verify. Expired or deactivated entries are auto-deleted.
-      </p>
-      <div class="form-row">
-        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
-          <input type="checkbox" id="hc-dry-run"><label for="hc-dry-run" style="cursor:pointer">Dry Run (check only, no delete)</label>
+    <div id="mon-deact" class="seg-panel">
+      <div class="card">
+        <h3>Deactivation Scan</h3>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+          Scan all DM accounts for OpenAI deactivation emails. Deactivated accounts are deleted from CPAB and disabled in DM.
+        </p>
+        <div class="form-row">
+          <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+            <input type="checkbox" id="ds-dry-run"><label for="ds-dry-run" style="cursor:pointer">Dry Run (check only)</label>
+          </div>
+          <div class="form-group"><label>Category (optional)</label>
+            <select id="ds-category">
+              <option value="">All</option>
+              <option value="enterprise">enterprise</option>
+              <option value="business">business</option>
+              <option value="plus">plus</option>
+              <option value="free">free</option>
+            </select>
+          </div>
+          <button class="btn btn-primary" onclick="doDeactivationScan()">Scan</button>
         </div>
-        <button class="btn btn-primary" onclick="doHealthCheck()">Run Health Check</button>
+      </div>
+      <div id="ds-log" class="card" style="display:none">
+        <h3>Progress <span id="ds-status" class="badge"></span></h3>
+        <div class="log-box" id="ds-log-box"></div>
       </div>
     </div>
-    <div id="hc-log" class="card" style="display:none">
-      <h3>Progress <span id="hc-status" class="badge"></span></h3>
-      <div class="log-box" id="hc-log-box"></div>
-    </div>
-  </div>
 
-  <!-- Deactivation Scan -->
-  <div id="tab-deactivation" class="panel">
-    <div class="card">
-      <h3>Deactivation Scan</h3>
-      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
-        Scan all DM accounts for OpenAI deactivation emails. Deactivated accounts are deleted from CPAB and disabled in DM.
-      </p>
-      <div class="form-row">
-        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
-          <input type="checkbox" id="ds-dry-run"><label for="ds-dry-run" style="cursor:pointer">Dry Run (check only)</label>
-        </div>
-        <div class="form-group"><label>Category (optional)</label>
-          <select id="ds-category">
-            <option value="">All</option>
-            <option value="enterprise">enterprise</option>
-            <option value="business">business</option>
-            <option value="plus">plus</option>
-            <option value="free">free</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" onclick="doDeactivationScan()">Scan</button>
+    <div id="mon-watchdog" class="seg-panel">
+      <div class="card">
+        <h3>Watchdog Status <button class="btn btn-sm btn-ghost" onclick="loadWatchdog()" style="margin-left:8px">Refresh</button></h3>
+        <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+          The Watchdog runs inside the Telegram bot — auto-scans inboxes for deactivation emails and verifies team ATs. Control via /watch in TG.
+        </p>
+        <div id="wd-info" style="font-family:monospace; font-size:0.85rem; color:var(--text-dim)">(loading...)</div>
       </div>
-    </div>
-    <div id="ds-log" class="card" style="display:none">
-      <h3>Progress <span id="ds-status" class="badge"></span></h3>
-      <div class="log-box" id="ds-log-box"></div>
     </div>
   </div>
 
@@ -434,32 +471,80 @@
     </div>
   </div>
 
-  <!-- Mark Paid -->
-  <div id="tab-mark-paid" class="panel">
+  <!-- Subscribe Flow (unified: Mark Paid + Writeback + OAuth Multi-WS) -->
+  <div id="tab-subscribe" class="panel">
     <div class="card">
-      <h3>Mark Subscribed</h3>
+      <h3>Subscribe Flow</h3>
       <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
-        Mark accounts as subscribed. Enter emails, payment links, or access tokens (one per line).
+        After payment: chain <b>Mark Paid → Writeback → OAuth Multi-WS</b>. Enter email, payment link, or access token (one per line for batch).
+        Toggle checkboxes to run only selected steps.
       </p>
       <div class="form-row">
         <div class="form-group" style="flex:1"><label>Emails / Links / Tokens (one per line)</label>
-          <textarea id="mp-targets" rows="4" style="width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:8px; border-radius:6px; font-size:0.85rem; font-family:monospace" placeholder="user@example.com&#10;https://chatgpt.com/checkout/...&#10;eyJhbG..."></textarea>
+          <textarea id="sb-targets" rows="3" style="width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:8px; border-radius:6px; font-size:0.85rem; font-family:monospace" placeholder="user@example.com&#10;https://chatgpt.com/checkout/...&#10;eyJhbG..."></textarea>
         </div>
       </div>
       <div class="form-row">
         <div class="form-group"><label>Category</label>
-          <select id="mp-category">
+          <select id="sb-category">
             <option value="enterprise">enterprise</option>
             <option value="business">business</option>
             <option value="plus">plus</option>
           </select>
         </div>
-        <button class="btn btn-primary" onclick="doMarkPaid()">Mark Paid</button>
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="sb-mark" checked><label for="sb-mark" style="cursor:pointer">① Mark Paid</label>
+        </div>
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="sb-writeback" checked><label for="sb-writeback" style="cursor:pointer">② Writeback</label>
+        </div>
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="sb-oauth" checked><label for="sb-oauth" style="cursor:pointer">③ OAuth Multi-WS</label>
+        </div>
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="sb-dmwb" checked><label for="sb-dmwb" style="cursor:pointer">DM writeback (step ③)</label>
+        </div>
+        <button class="btn btn-primary" onclick="doSubscribe()">Run</button>
       </div>
     </div>
-    <div id="mp-result" class="card" style="display:none">
+    <div id="sb-result" class="card" style="display:none">
       <h3>Results</h3>
-      <div id="mp-result-box" class="log-box"></div>
+      <div id="sb-result-box" class="log-box"></div>
+    </div>
+  </div>
+
+  <!-- Invite -->
+  <div id="tab-invite" class="panel">
+    <div class="card">
+      <h3>Invite Team Members</h3>
+      <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
+        Invite users to a team workspace using an existing team account's AT (from DM).
+      </p>
+      <div class="form-row">
+        <div class="form-group" style="flex:1; min-width:260px"><label>Source Email (DM team account)</label>
+          <input type="text" id="iv-source" list="iv-source-list" placeholder="team@example.com">
+          <datalist id="iv-source-list"></datalist>
+        </div>
+        <div class="form-group"><label>Role</label>
+          <select id="iv-role">
+            <option value="standard-user">standard-user</option>
+            <option value="account-admin">account-admin</option>
+          </select>
+        </div>
+        <button class="btn btn-sm btn-ghost" onclick="loadTeamSources()">Refresh sources</button>
+      </div>
+      <div class="form-row">
+        <div class="form-group" style="flex:1"><label>Target Emails (one per line)</label>
+          <textarea id="iv-targets" rows="4" style="width:100%; background:var(--bg); border:1px solid var(--border); color:var(--text); padding:8px; border-radius:6px; font-size:0.85rem; font-family:monospace" placeholder="invite1@gmail.com&#10;invite2@gmail.com"></textarea>
+        </div>
+      </div>
+      <div class="form-row">
+        <button class="btn btn-primary" onclick="doInvite()">Send Invites</button>
+      </div>
+    </div>
+    <div id="iv-result" class="card" style="display:none">
+      <h3>Results</h3>
+      <div id="iv-result-box" class="log-box"></div>
     </div>
   </div>
 
@@ -593,8 +678,176 @@ document.querySelectorAll('.tab').forEach(tab => {
     tab.classList.add('active');
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     if (tab.dataset.tab === 'tasks') loadTasks();
+    if (tab.dataset.tab === 'invite') loadTeamSources();
+    if (tab.dataset.tab === 'monitoring') {
+      // If watchdog mode is active, auto-refresh
+      const wm = document.querySelector('[data-mon-mode="watchdog"]');
+      if (wm && wm.classList.contains('active')) loadWatchdog();
+    }
   });
 });
+
+// ── OAuth segmented control ──
+function setOAuthMode(mode) {
+  document.querySelectorAll('[data-oauth-mode]').forEach(b => b.classList.toggle('active', b.dataset.oauthMode === mode));
+  const ids = {team: 'oauth-team', free: 'oauth-free', multi: 'oauth-multi'};
+  ['oauth-team', 'oauth-free', 'oauth-multi'].forEach(id => {
+    document.getElementById(id).classList.toggle('active', id === ids[mode]);
+  });
+}
+
+// ── Monitoring segmented control ──
+function setMonMode(mode) {
+  document.querySelectorAll('[data-mon-mode]').forEach(b => b.classList.toggle('active', b.dataset.monMode === mode));
+  const ids = {health: 'mon-health', deact: 'mon-deact', watchdog: 'mon-watchdog'};
+  ['mon-health', 'mon-deact', 'mon-watchdog'].forEach(id => {
+    document.getElementById(id).classList.toggle('active', id === ids[mode]);
+  });
+  if (mode === 'watchdog') loadWatchdog();
+}
+
+// ── Watchdog status ──
+async function loadWatchdog() {
+  const el = document.getElementById('wd-info');
+  el.textContent = 'loading...';
+  try {
+    const r = await fetch(API + '/api/watchdog/status');
+    const data = await r.json();
+    if (!data.ok) {
+      el.innerHTML = `<span class="warn">${data.error || 'unavailable'}</span>\n<span style="color:var(--text-muted)">${data.hint || ''}</span>`;
+      return;
+    }
+    const mins = Math.round((data.interval_sec || 0) / 60);
+    const last = data.last_run ? new Date(data.last_run).toLocaleString() : '(never)';
+    let html = `<div><b style="color:var(--green)">● Running</b>   interval: ${mins} min   last: ${last}</div>`;
+    html += `<div style="margin-top:6px">Team ATs — healthy: <span class="ok">${data.team_ats_healthy || 0}</span>, broken: <span class="err">${data.team_ats_broken || 0}</span>, errors: <span class="warn">${data.team_ats_errors || 0}</span></div>`;
+    html += `<div>Alerted (session): ${data.alerted_count || 0} email(s)</div>`;
+    if (data.last_alerts && data.last_alerts.length) {
+      html += `<div style="margin-top:10px; color:var(--text-dim)">Recent alerts:</div>`;
+      html += '<div>' + data.last_alerts.map(a => `<div>${a.replace(/&/g,'&amp;').replace(/</g,'&lt;')}</div>`).join('') + '</div>';
+    }
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = `<span class="err">Failed: ${e.message}</span>`;
+  }
+}
+
+// ── Subscribe flow ──
+async function doSubscribe() {
+  const raw = document.getElementById('sb-targets').value.trim();
+  if (!raw) return alert('Enter at least one email/link/token');
+  const targets = raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+  const category = document.getElementById('sb-category').value;
+  const doMark = document.getElementById('sb-mark').checked;
+  const doWb = document.getElementById('sb-writeback').checked;
+  const doOauth = document.getElementById('sb-oauth').checked;
+  const dmWb = document.getElementById('sb-dmwb').checked;
+
+  const box = document.getElementById('sb-result-box');
+  const card = document.getElementById('sb-result');
+  card.style.display = 'block';
+  box.innerHTML = `Processing ${targets.length} target(s)...`;
+
+  // If only Mark Paid is selected, use the fast /api/mark-paid batch endpoint
+  if (doMark && !doWb && !doOauth) {
+    try {
+      const r = await fetch(API + '/api/mark-paid', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({targets, category}),
+      });
+      const data = await r.json();
+      box.innerHTML = (data.results || []).map(x => {
+        if (x.ok) return `<span class="ok">✅ ${x.email} → ${category} (9 seats)</span>`;
+        return `<span class="err">❌ ${x.email || x.target} — ${x.error || (x.failed_fields || []).join(', ')}</span>`;
+      }).join('\n');
+      return;
+    } catch(e) { box.innerHTML = `<span class="err">Failed: ${e.message}</span>`; return; }
+  }
+
+  // Otherwise, run one subscribe-flow task per target
+  const lines = [];
+  for (const target of targets) {
+    try {
+      const startR = await fetch(API + '/api/subscribe-flow', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          target, category,
+          do_mark_paid: doMark, do_writeback: doWb,
+          do_oauth_multi: doOauth, dm_writeback: dmWb,
+        }),
+      });
+      const startData = await startR.json();
+      const taskId = startData.task_id;
+      if (!taskId) { lines.push(`<span class="err">❌ ${target}: ${JSON.stringify(startData)}</span>`); continue; }
+      // Poll until done
+      while (true) {
+        await new Promise(r => setTimeout(r, 2500));
+        const tr = await fetch(API + '/api/tasks/' + taskId);
+        const task = await tr.json();
+        if (task.status === 'running') {
+          box.innerHTML = lines.concat([`⏳ ${target}\n   ` + (task.logs || []).slice(-3).map(l => l.replace(/</g,'&lt;')).join('\n   ')]).join('\n\n');
+          continue;
+        }
+        const res = task.result || {};
+        if (res.ok && res.steps) {
+          const step_str = res.steps.map(s => `${s.ok ? '✅' : '❌'} ${s.name}${s.detail ? ' (' + s.detail + ')' : ''}`).join(' | ');
+          lines.push(`<span class="ok">${res.email || target}</span>: ${step_str}`);
+        } else {
+          lines.push(`<span class="err">❌ ${target}: ${res.error || task.status}</span>`);
+        }
+        break;
+      }
+      box.innerHTML = lines.join('\n\n');
+    } catch(e) { lines.push(`<span class="err">❌ ${target}: ${e.message}</span>`); box.innerHTML = lines.join('\n\n'); }
+  }
+}
+
+// ── Invite ──
+async function loadTeamSources() {
+  try {
+    const r = await fetch(API + '/api/accounts');
+    const data = await r.json();
+    const list = document.getElementById('iv-source-list');
+    const sources = (data.accounts || []).filter(a =>
+      (a.token_context || '').toLowerCase() === 'team' &&
+      (a.status || '').toLowerCase() === 'active'
+    );
+    list.innerHTML = sources.map(a => `<option value="${a.email}">`).join('');
+  } catch(e) { console.error('loadTeamSources', e); }
+}
+
+async function doInvite() {
+  const source = document.getElementById('iv-source').value.trim();
+  const role = document.getElementById('iv-role').value;
+  const raw = document.getElementById('iv-targets').value.trim();
+  if (!source) return alert('Source email required');
+  if (!raw) return alert('At least one target email required');
+  const targets = raw.split(/[\n\s,]+/).map(s => s.trim()).filter(s => s.includes('@'));
+  if (!targets.length) return alert('No valid target emails');
+
+  const card = document.getElementById('iv-result');
+  const box = document.getElementById('iv-result-box');
+  card.style.display = 'block';
+  box.innerHTML = `Inviting ${targets.length} target(s) via ${source}...`;
+
+  try {
+    const r = await fetch(API + '/api/invite', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({source_email: source, targets, role}),
+    });
+    const data = await r.json();
+    if (!data.ok) { box.innerHTML = `<span class="err">❌ ${data.error || JSON.stringify(data)}</span>`; return; }
+    const lines = [];
+    lines.push(`<span class="ok">✅ ${data.invites?.length || 0} invite(s) sent via ${source}</span>`);
+    (data.invites || []).forEach(i => {
+      lines.push(`  ${i.email_address} → ${i.role} (id: ${i.id})`);
+    });
+    if (data.errored && data.errored.length) {
+      lines.push(`<span class="err">⚠️ Errored: ${data.errored.join(', ')}</span>`);
+    }
+    box.innerHTML = lines.join('\n');
+  } catch(e) { box.innerHTML = `<span class="err">Failed: ${e.message}</span>`; }
+}
 
 // ── Accounts ──
 let allAccounts = [];
@@ -710,7 +963,8 @@ function doOAuthMulti() {
   if (!email) return alert('Email is required');
   const wsRaw = document.getElementById('om-ws-ids').value.trim();
   const ws_ids = wsRaw ? wsRaw.split(',').map(s => s.trim()).filter(Boolean) : null;
-  submitTask('/api/oauth-multi', {email, workspace_ids: ws_ids}, 'om');
+  const writeback = document.getElementById('om-writeback').checked;
+  submitTask('/api/oauth-multi', {email, workspace_ids: ws_ids, writeback}, 'om');
 }
 
 function doHealthCheck() {
@@ -745,30 +999,6 @@ async function doPay() {
       if (r.ok) return `<span class="ok">✅ ${r.email}</span>\n   <a href="${r.link}" target="_blank" style="color:var(--primary)">${r.link}</a>\n   Workspace: ${r.workspace || '?'}`;
       return `<span class="err">❌ ${r.email}: ${r.error}</span>`;
     }).join('\n\n');
-  } catch(e) { box.innerHTML = '<span class="err">Failed: ' + e.message + '</span>'; }
-}
-
-async function doMarkPaid() {
-  const raw = document.getElementById('mp-targets').value.trim();
-  if (!raw) return alert('Enter at least one email/link/token');
-  const targets = raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
-  const category = document.getElementById('mp-category').value;
-  const box = document.getElementById('mp-result-box');
-  const card = document.getElementById('mp-result');
-  card.style.display = 'block';
-  box.innerHTML = 'Processing ' + targets.length + ' item(s)...';
-  try {
-    const r = await fetch(API + '/api/mark-paid', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({targets, category}),
-    });
-    const data = await r.json();
-    box.innerHTML = (data.results || []).map(r => {
-      if (r.ok) return `<span class="ok">✅ ${r.email} → ${category} (9 seats)</span>`;
-      const label = r.email || r.target || '?';
-      const err = r.error || (r.failed_fields || []).join(', ');
-      return `<span class="err">❌ ${label}: ${err}</span>`;
-    }).join('\n');
   } catch(e) { box.innerHTML = '<span class="err">Failed: ' + e.message + '</span>'; }
 }
 

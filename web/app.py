@@ -245,6 +245,23 @@ class TaskProxyReq(BaseModel):
     proxy: str  # url or "none" or "clear"
 
 
+class SubscribeFlowReq(BaseModel):
+    target: str  # email | payment_link | AT token
+    category: str = "enterprise"
+    do_mark_paid: bool = True
+    do_writeback: bool = True
+    do_oauth_multi: bool = True
+    dm_writeback: bool = True  # for oauth_multi step
+    seats: int = 9
+    proxy: Optional[str] = None
+
+
+class InviteReq(BaseModel):
+    source_email: str
+    targets: list[str]
+    role: str = "standard-user"
+
+
 # ---------------------------------------------------------------------------
 #  Task helpers
 # ---------------------------------------------------------------------------
@@ -280,6 +297,269 @@ def _finish(task_id: str, result: Any, status: str = "done"):
 
 def _is_stopped(task_id: str) -> bool:
     return tasks.get(task_id, {}).get("stop_requested", False)
+
+
+# ---------------------------------------------------------------------------
+#  Shared helpers — extracted for reuse across task runners and endpoints
+# ---------------------------------------------------------------------------
+
+def _resolve_account_by_input(dm: DataManager, target: str) -> dict | None:
+    """Resolve a DM account from email / payment-link / AT token."""
+    t = (target or "").strip()
+    if not t:
+        return None
+    if "@" in t and "chatgpt.com" not in t:
+        return dm.find_account(t, include_disabled=True)
+    if "chatgpt.com" in t or "checkout" in t:
+        for a in dm.list_accounts(include_disabled=True):
+            pl = a.get("payment_link") or ""
+            if pl and (t in pl or pl in t):
+                return a
+        return None
+    if len(t) > 100 and "." in t:
+        claims = decode_jwt_claims(t)
+        email = claims.get("https://api.openai.com/profile", {}).get("email", "")
+        if email:
+            return dm.find_account(email, include_disabled=True)
+    return None
+
+
+def _mark_account_paid(dm: DataManager, acc_id: int, category: str = "enterprise",
+                       seats: int = 9) -> dict:
+    """Apply subscribed-state field PATCHes to DM account.
+    Returns {ok, failed_fields[]}. Each field patched individually with 1 retry."""
+    import time as _t
+    fields = [
+        ("category", category),
+        ("status", "active"),
+        ("subscription_status", "active"),
+        ("subscription_at", datetime.datetime.now(datetime.timezone.utc).isoformat()),
+        ("seats_total", seats),
+        ("seats_left", seats),
+        ("token_context", "free"),
+    ]
+    failed = []
+    for k, v in fields:
+        for _ in range(2):
+            r = dm.patch_account(acc_id, {k: v})
+            if r.get("ok"):
+                break
+            _t.sleep(0.3)
+        else:
+            failed.append(k)
+    return {"ok": not failed, "failed_fields": failed}
+
+
+def _writeback_one(dm: DataManager, acc: dict, proxy: str | None,
+                    password: str, otp_token: str) -> dict:
+    """Fetch fresh ChatGPT session AT for one account and PATCH DM.
+    Returns {ok, at, plan_type, account_id, token_context, error}."""
+    email = acc.get("email", "")
+    acc_id = acc.get("id")
+    if not email or not acc_id:
+        return {"ok": False, "error": "missing_email_or_id"}
+
+    result = get_chatgpt_session_at(email, password, otp_token, proxy)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error", "session_failed")}
+
+    at = result["access_token"]
+    claims = decode_jwt_claims(at)
+    auth_info = claims.get("https://api.openai.com/auth", {})
+    plan_type = auth_info.get("chatgpt_plan_type", "")
+    account_id = auth_info.get("chatgpt_account_id", "")
+    new_tc = "team" if plan_type in ("team", "enterprise", "business") else "free"
+
+    patch_body = {"access_token": at, "token_context": new_tc}
+    if account_id:
+        patch_body["account_id"] = account_id
+    pr = dm.patch_account(acc_id, patch_body)
+    if not pr.get("ok"):
+        return {"ok": False, "error": "patch_failed", "at": at,
+                "plan_type": plan_type, "account_id": account_id}
+
+    # Save session file
+    try:
+        session_file = os.path.join(OUTPUT_DIR, f"{email}.session.json")
+        with open(session_file, "w") as f:
+            json.dump({"email": email, "access_token": at,
+                       "session_cookie": result.get("session_cookie", ""),
+                       "plan_type": plan_type, "token_context": new_tc,
+                       "account_id": account_id,
+                       "created_at": datetime.datetime.utcnow().isoformat() + "Z"},
+                      f, indent=2)
+    except Exception:
+        pass
+
+    return {"ok": True, "at": at, "plan_type": plan_type,
+            "account_id": account_id, "token_context": new_tc}
+
+
+def _oauth_multi_one(cpa_admin: CPAAdmin, email: str, password: str,
+                      otp_token: str, proxy: str | None,
+                      workspace_filter: list | None,
+                      writeback: bool, dm: DataManager | None,
+                      log_fn) -> dict:
+    """Run oauth_login_multi for one account; optionally DM-writeback per WS.
+    Returns {ok, workspaces, results[], error}."""
+    def _start():
+        return cpa_admin.start_oauth()
+
+    multi = oauth_login_multi(
+        start_oauth_fn=_start,
+        email=email,
+        password=password,
+        otp_token=otp_token,
+        proxy=proxy,
+        workspace_filter=workspace_filter,
+        log_fn=log_fn,
+    )
+
+    if not multi.get("ok") and not multi.get("results"):
+        return {"ok": False, "error": multi.get("error"),
+                "workspaces": [], "results": []}
+
+    workspaces = multi.get("workspaces", [])
+    results = multi.get("results", [])
+    final_results = []
+
+    for r in results:
+        ws_id = r.get("workspace_id", "?")
+        ws_name = r.get("workspace_name", "?")
+        ws_kind = r.get("workspace_kind", "?")
+        tag = f"{ws_name} ({ws_kind})"
+
+        if not r.get("ok") or not r.get("code"):
+            log_fn(f"  ⏭️ {tag}: skipped — {r.get('error', 'no code')}")
+            final_results.append({
+                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+                "ok": False, "error": r.get("error", "no_code"),
+            })
+            continue
+
+        code = r["code"]
+        state = r.get("state", "")
+        cb_resp = cpa_admin.oauth_callback(state, code)
+        if not cb_resp.get("ok"):
+            log_fn(f"  ❌ {tag}: callback failed: {cb_resp}")
+            final_results.append({
+                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+                "ok": False, "error": f"callback: {cb_resp}",
+            })
+            continue
+
+        log_fn(f"  ✅ {tag}: callback ok")
+
+        auth = cpa_admin.find_auth_by_email(email)
+        dm_written = False
+        if auth:
+            auth_id = auth.get("id")
+            cpa_admin.set_priority(auth_id, 100)
+            log_fn(f"     auth_id={auth_id} priority set")
+
+        # DM writeback for this specific workspace
+        if writeback and auth and dm:
+            cpab_at = None
+            fresh_files = cpa_admin.list_auth_files()
+            for ff in fresh_files:
+                fc = ff.get("content") or {}
+                if isinstance(fc, str):
+                    try:
+                        fc = json.loads(fc)
+                    except Exception:
+                        continue
+                if (fc.get("email") or "").lower() != email.lower():
+                    continue
+                if "codex" not in (fc.get("type") or "").lower():
+                    continue
+                ff_at = fc.get("access_token", "")
+                if not ff_at or len(ff_at) < 100:
+                    continue
+                ff_claims = decode_jwt_claims(ff_at)
+                ff_aid = ff_claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id", "")
+                if ff_aid == ws_id:
+                    cpab_at = ff_at
+                    break
+
+            if cpab_at:
+                claims = decode_jwt_claims(cpab_at)
+                auth_info = claims.get("https://api.openai.com/auth", {})
+                plan_type = auth_info.get("chatgpt_plan_type", "")
+                account_id = auth_info.get("chatgpt_account_id", "")
+                new_tc = "team" if plan_type in ("team", "enterprise", "business") else "free"
+
+                dm_acc = dm.find_account(email)
+                if dm_acc:
+                    patch_body = {"access_token": cpab_at, "token_context": new_tc}
+                    if account_id:
+                        patch_body["team_account_id"] = account_id
+                    pr = dm.patch_account(dm_acc["id"], patch_body)
+                    dm_written = pr.get("ok", False)
+                    if dm_written:
+                        log_fn(f"     DM writeback: tc={new_tc}, plan={plan_type}, ws={account_id}")
+                    else:
+                        log_fn(f"     ⚠️ DM writeback failed")
+            else:
+                log_fn(f"     ⚠️ CPAB AT for workspace {ws_id} not found")
+
+        final_results.append({
+            "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
+            "ok": True, "dm_written": dm_written,
+        })
+
+    return {"ok": True, "workspaces": workspaces, "results": final_results}
+
+
+def _invite_via_at(access_token: str, target_emails: list, role: str,
+                    proxy: str | None = None) -> dict:
+    """Invite team members via ChatGPT backend API using source account AT.
+    Returns {ok, invites: [{id, email, role}], errored: [...], error}."""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        return {"ok": False, "error": "curl_cffi not available"}
+
+    claims = decode_jwt_claims(access_token)
+    auth_info = claims.get("https://api.openai.com/auth", {})
+    account_id = auth_info.get("chatgpt_account_id", "")
+    if not account_id:
+        return {"ok": False, "error": "no_account_id_in_jwt"}
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+    }
+    proxies = {"https": proxy, "http": proxy} if proxy else None
+
+    try:
+        r = cffi_requests.post(
+            f"https://chatgpt.com/backend-api/accounts/{account_id}/invites",
+            headers=headers,
+            json={"email_addresses": target_emails, "role": role},
+            impersonate="chrome136",
+            proxies=proxies,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"request_failed: {e}"}
+
+    if r.status_code not in (200, 201):
+        return {"ok": False, "error": f"http_{r.status_code}: {r.text[:300]}"}
+
+    try:
+        data = r.json()
+    except Exception:
+        return {"ok": False, "error": f"invalid_json: {r.text[:200]}"}
+
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "invites": data.get("account_invites", []),
+        "errored": data.get("errored_emails", []),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +1124,121 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
         "email": email,
         "workspaces": workspaces,
         "results": final_results,
+    })
+
+
+def _run_subscribe_flow(task_id: str, req: SubscribeFlowReq):
+    """
+    Unified post-subscription flow:
+      1. Resolve target (email/link/token) → DM account
+      2. Mark Paid (optional)
+      3. Writeback — fetch team session AT → DM (optional)
+      4. OAuth Multi-WS → CPAB + DM writeback (optional)
+    Each step independently skippable; failures don't block later steps.
+    """
+    cfg = CFG
+    proxy = _get_proxy(req.proxy, "subscribe-flow")
+    password = cfg["reg_password"]
+    otp_token = cfg["otp_token"]
+    dm = DataManager(cfg["dm_base"], cfg["dm_token"])
+
+    steps = []  # [{name, ok, detail}]
+
+    # 1) Resolve
+    _log(task_id, f"🔍 Resolving target: {req.target[:60]}...")
+    acc = _resolve_account_by_input(dm, req.target)
+    if not acc:
+        _log(task_id, "❌ account not found")
+        _finish(task_id, {"ok": False, "error": "account_not_found",
+                          "target": req.target[:80], "steps": []}, "error")
+        return
+
+    email = acc.get("email", "?")
+    acc_id = acc.get("id")
+    _log(task_id, f"✅ resolved: {email} (id={acc_id}, cat={acc.get('category','?')}, "
+                  f"tc={acc.get('token_context','?')})")
+
+    # 2) Mark Paid
+    if req.do_mark_paid:
+        _log(task_id, f"[1/3] 📝 Mark Paid → {req.category} ({req.seats} seats)")
+        mp = _mark_account_paid(dm, acc_id, req.category, req.seats)
+        if mp["ok"]:
+            _log(task_id, f"  ✅ all fields updated")
+            steps.append({"name": "mark_paid", "ok": True})
+        else:
+            _log(task_id, f"  ⚠️ partial: failed = {mp['failed_fields']}")
+            steps.append({"name": "mark_paid", "ok": False,
+                          "detail": f"failed_fields: {mp['failed_fields']}"})
+        # Refetch account for later steps to see latest state
+        acc = dm.find_account(email) or acc
+    else:
+        _log(task_id, f"[1/3] ⏭️ Mark Paid skipped")
+
+    # 3) Writeback
+    if req.do_writeback:
+        _log(task_id, f"[2/3] 🔄 Writeback (fetch session AT)")
+        if _is_stopped(task_id):
+            _log(task_id, "🛑 stopped before writeback")
+            _finish(task_id, {"ok": False, "email": email, "steps": steps,
+                              "error": "stopped"}, "stopped")
+            return
+        wb = _writeback_one(dm, acc, proxy, password, otp_token)
+        if wb["ok"]:
+            _log(task_id, f"  ✅ AT obtained (plan={wb['plan_type']}, tc={wb['token_context']})")
+            steps.append({"name": "writeback", "ok": True,
+                          "detail": f"plan={wb['plan_type']}, tc={wb['token_context']}"})
+        else:
+            _log(task_id, f"  ❌ {wb.get('error','?')}")
+            steps.append({"name": "writeback", "ok": False,
+                          "detail": wb.get("error", "?")})
+    else:
+        _log(task_id, f"[2/3] ⏭️ Writeback skipped")
+
+    # 4) OAuth Multi-WS
+    if req.do_oauth_multi:
+        _log(task_id, f"[3/3] 🔐 OAuth Multi-WS → CPAB"
+                      + (" (+ DM writeback)" if req.dm_writeback else ""))
+        if _is_stopped(task_id):
+            _log(task_id, "🛑 stopped before oauth-multi")
+            _finish(task_id, {"ok": False, "email": email, "steps": steps,
+                              "error": "stopped"}, "stopped")
+            return
+        cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"],
+                             cfg["cpa_admin_password"])
+        if not cpa_admin.login():
+            _log(task_id, f"  ❌ CPA admin login failed")
+            steps.append({"name": "oauth_multi", "ok": False,
+                          "detail": "cpa_admin_login_failed"})
+        else:
+            om = _oauth_multi_one(
+                cpa_admin=cpa_admin, email=email,
+                password=password, otp_token=otp_token, proxy=proxy,
+                workspace_filter=None,
+                writeback=req.dm_writeback, dm=dm,
+                log_fn=lambda m: _log(task_id, m),
+            )
+            if om["ok"]:
+                n_ok = sum(1 for r in om["results"] if r["ok"])
+                n_total = len(om["results"])
+                _log(task_id, f"  Summary: {n_ok}/{n_total} workspaces OAuth'd")
+                steps.append({"name": "oauth_multi", "ok": n_ok > 0,
+                              "detail": f"{n_ok}/{n_total} workspaces",
+                              "workspaces": om["workspaces"],
+                              "results": om["results"]})
+            else:
+                _log(task_id, f"  ❌ {om.get('error','?')}")
+                steps.append({"name": "oauth_multi", "ok": False,
+                              "detail": om.get("error", "?")})
+    else:
+        _log(task_id, f"[3/3] ⏭️ OAuth Multi-WS skipped")
+
+    ok_count = sum(1 for s in steps if s["ok"])
+    _log(task_id, f"🎉 Flow done: {ok_count}/{len(steps)} steps ok")
+    _finish(task_id, {
+        "ok": True,
+        "email": email,
+        "account_id": acc_id,
+        "steps": steps,
     })
 
 
@@ -1430,45 +1825,59 @@ async def api_pay(req: PayReq):
 async def api_mark_paid(req: MarkPaidReq):
     """Mark accounts as subscribed. Accepts emails, payment links, or tokens."""
     dm = DataManager(CFG["dm_base"], CFG["dm_token"])
-    import datetime as _dt
     results = []
     for t in req.targets:
-        t = t.strip()
-        acc = None
-        if "@" in t and "chatgpt.com" not in t:
-            acc = dm.find_account(t, include_disabled=True)
-        elif "chatgpt.com" in t or "checkout" in t:
-            for a in dm.list_accounts(include_disabled=True):
-                pl = a.get("payment_link") or ""
-                if pl and (t in pl or pl in t):
-                    acc = a
-                    break
-        elif len(t) > 100 and "." in t:
-            claims = decode_jwt_claims(t)
-            email = claims.get("https://api.openai.com/profile", {}).get("email", "")
-            if email:
-                acc = dm.find_account(email, include_disabled=True)
-
+        acc = _resolve_account_by_input(dm, t)
         if not acc:
             results.append({"target": t[:40], "ok": False, "error": "not_found"})
             continue
-
-        fields = [("category", req.category), ("status", "active"),
-                  ("subscription_status", "active"),
-                  ("subscription_at", _dt.datetime.now(_dt.timezone.utc).isoformat()),
-                  ("seats_total", 9), ("seats_left", 9), ("token_context", "free")]
-        failed = []
-        for k, v in fields:
-            for _ in range(2):
-                r = dm.patch_account(acc["id"], {k: v})
-                if r.get("ok"):
-                    break
-                import time; time.sleep(0.3)
-            else:
-                failed.append(k)
-        results.append({"email": acc.get("email"), "ok": not failed,
-                       "failed_fields": failed or None})
+        mp = _mark_account_paid(dm, acc["id"], req.category, seats=9)
+        results.append({"email": acc.get("email"), "ok": mp["ok"],
+                       "failed_fields": mp["failed_fields"] or None})
     return {"results": results}
+
+
+@app.post("/api/subscribe-flow")
+async def api_subscribe_flow(req: SubscribeFlowReq):
+    """Unified post-subscription flow: mark_paid → writeback → oauth_multi."""
+    task_id = _create_task("subscribe-flow", req.model_dump())
+    threading.Thread(target=_run_subscribe_flow, args=(task_id, req), daemon=True).start()
+    return {"task_id": task_id}
+
+
+@app.post("/api/invite")
+async def api_invite(req: InviteReq):
+    """Invite team members using a source account's AT (from DM)."""
+    dm = DataManager(CFG["dm_base"], CFG["dm_token"])
+    acc = dm.find_account(req.source_email)
+    if not acc:
+        raise HTTPException(404, f"{req.source_email} not found in DM")
+    at = acc.get("access_token", "")
+    if not at or len(at) < 100:
+        raise HTTPException(400, "source account has no valid AT")
+
+    proxy = _get_proxy(None, "invite")
+    targets = [t.strip() for t in req.targets if t.strip()]
+    if not targets:
+        raise HTTPException(400, "no target emails")
+
+    result = _invite_via_at(at, targets, req.role, proxy)
+    return result
+
+
+@app.get("/api/watchdog/status")
+async def api_watchdog_status():
+    """Read watchdog status written by the bot process (if any)."""
+    status_file = "/tmp/codex_watchdog.json"
+    try:
+        with open(status_file, "r") as f:
+            data = json.load(f)
+        return {"ok": True, **data}
+    except FileNotFoundError:
+        return {"ok": False, "error": "no_status_file",
+                "hint": "watchdog runs inside TG bot — use /watch in Telegram"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/api/deact-check")

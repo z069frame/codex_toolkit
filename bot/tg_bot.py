@@ -38,10 +38,10 @@ from core.api import (CPAAdmin, CPAMgmt, DataManager, decode_jwt_claims,
 from web.app import (
     _create_task, _log, _finish, _is_stopped, tasks,
     _run_register, _run_session, _run_writeback, _run_relogin,
-    _run_oauth, _run_oauth_free, _run_oauth_multi,
+    _run_oauth, _run_oauth_free, _run_oauth_multi, _run_subscribe_flow,
     _run_health_check, _run_deactivation_scan,
     RegisterReq, SingleEmailReq, OAuthFreeReq, OAuthMultiReq,
-    HealthCheckReq, DeactivationScanReq,
+    HealthCheckReq, DeactivationScanReq, SubscribeFlowReq,
     _get_proxy, _parse_proxy, _mask_proxy, _save_proxy,
     CFG, OUTPUT_DIR,
 )
@@ -913,6 +913,49 @@ async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(results))
 
 
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unified post-subscription flow: mark_paid → writeback → oauth_multi.
+    Usage: /subscribe <email|link|token> [category]
+    Optional flags in args: nomark / nowriteback / nooauth / nowb
+    """
+    if not _auth_check(update):
+        return await _denied(update)
+    args = context.args or []
+    if not args:
+        return await update.message.reply_text(
+            "Usage: /subscribe <email|link|token> [category] [flags]\n\n"
+            "Runs: mark_paid → writeback → oauth_multi (+ DM writeback)\n"
+            "Flags (disable a step): nomark | nowriteback | nooauth | nowb\n"
+            "Categories: enterprise (default), business, plus")
+
+    _CATEGORIES = {"enterprise", "business", "plus"}
+    _FLAGS = {"nomark", "nowriteback", "nooauth", "nowb"}
+    target = None
+    category = "enterprise"
+    flags = set()
+    for a in args:
+        al = a.lower()
+        if al in _FLAGS:
+            flags.add(al)
+        elif al in _CATEGORIES:
+            category = al
+        elif not target:
+            target = a
+
+    if not target:
+        return await update.message.reply_text("❌ Provide email, payment link, or AT")
+
+    req = SubscribeFlowReq(
+        target=target,
+        category=category,
+        do_mark_paid=("nomark" not in flags),
+        do_writeback=("nowriteback" not in flags),
+        do_oauth_multi=("nooauth" not in flags),
+        dm_writeback=("nowb" not in flags),
+    )
+    await _run_task_and_report(update, context, "subscribe-flow", req, _run_subscribe_flow)
+
+
 # ---------------------------------------------------------------------------
 #  Callback query handler (InlineKeyboard menu)
 # ---------------------------------------------------------------------------
@@ -1192,6 +1235,24 @@ async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Watchdog: no issues — %d team ATs healthy",
                     at_check["healthy_count"])
 
+    # Persist status for Web UI consumption
+    try:
+        import datetime as _dt
+        status_data = {
+            "running": True,
+            "interval_sec": _watchdog_interval,
+            "last_run": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "alerted_count": len(_alerted_emails),
+            "team_ats_healthy": at_check["healthy_count"],
+            "team_ats_broken": len(broken_ats),
+            "team_ats_errors": len(at_errors),
+            "last_alerts": action_lines[:5],
+        }
+        with open("/tmp/codex_watchdog.json", "w") as f:
+            json.dump(status_data, f)
+    except Exception as e:
+        logger.warning("Watchdog: failed to write status file: %s", e)
+
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Control deactivation watchdog.
@@ -1293,6 +1354,7 @@ def main():
     app.add_handler(CommandHandler("deact", cmd_deact))
     app.add_handler(CommandHandler("pay", cmd_pay))
     app.add_handler(CommandHandler("mark_paid", cmd_mark_paid))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("watch", cmd_watch))
 
     # Inline keyboard
@@ -1323,6 +1385,7 @@ def main():
             ("watch", "Deact watchdog: /watch on [min] | off"),
             ("pay", "Payment link: /pay [email] [country] [seats]"),
             ("mark_paid", "Mark paid: /mark_paid <email|link> [cat]"),
+            ("subscribe", "Subscribe flow: mark+writeback+oauth_multi"),
             ("proxy", "Proxy: /proxy [url]"),
         ])
 
