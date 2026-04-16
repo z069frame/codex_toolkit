@@ -963,22 +963,16 @@ def _is_deact_email(msg: dict) -> bool:
     return "deactivated" in subj and "openai" in subj
 
 
-async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic job: scan global inbox (2 workers) for deactivation emails."""
+async def _scan_inbox_deactivation(otp_token: str) -> list:
+    """Scan the 2 worker inboxes for new deactivation emails within the interval.
+    Returns list of {email, subject, date} for emails NOT yet alerted."""
     global _alerted_emails
-    chat_id = _watchdog_chat_id
-    if not chat_id:
-        return
-
-    otp_token = CFG.get("otp_token", "")
-    new_deactivated = []
-
     import urllib.request, json as _json
     from datetime import datetime, timezone, timedelta
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=_watchdog_interval + 60)
 
+    new_hits = []
     for domain in _WATCHDOG_DOMAINS:
-        # Fetch enough emails to cover the interval; paginate if needed
         all_emails = []
         page = 0
         while True:
@@ -990,49 +984,199 @@ async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE):
                 with urllib.request.urlopen(req, timeout=10) as r:
                     data = _json.loads(r.read())
             except Exception as e:
-                logger.warning("Watchdog: failed to fetch %s page %d: %s", domain, page, e)
+                logger.warning("Watchdog inbox: %s page %d failed: %s", domain, page, e)
                 break
-
             items = data if isinstance(data, list) else (data.get("items") or data.get("data") or [])
             if not items:
                 break
             all_emails.extend(items)
-
-            # Check if oldest email in this batch is still within interval
             oldest_date = items[-1].get("created_at", "")
             try:
                 oldest_dt = datetime.fromisoformat(oldest_date.replace("Z", "+00:00"))
                 if oldest_dt < cutoff:
-                    break  # reached emails older than interval
+                    break
             except Exception:
                 break
             page += 1
-            if page > 10:  # safety limit
+            if page > 10:
                 break
 
-        emails_list = all_emails
-
-        for msg in emails_list:
+        for msg in all_emails:
             if not _is_deact_email(msg):
                 continue
             rcpt = (msg.get("rcpt_to") or "").lower()
             if rcpt in _alerted_emails:
                 continue
             _alerted_emails.add(rcpt)
-            new_deactivated.append({
+            new_hits.append({
                 "email": rcpt,
                 "subject": msg.get("subject", "")[:60],
                 "date": msg.get("created_at", "")[:19],
             })
+    return new_hits
 
-    if new_deactivated:
-        lines = [f"🚨 Deactivation Alert — {len(new_deactivated)} new\n"]
-        for d in new_deactivated:
-            lines.append(f"🔴 {d['email']}\n   {d['subject']}  ({d['date']})")
+
+# Track AT verification state to avoid re-alerting each cycle
+_at_failed_alerted: set[str] = set()
+_at_error_alerted: set[str] = set()
+
+
+def _verify_team_ats(dm: DataManager) -> dict:
+    """Verify all team-context account ATs via DM /api/token/verify.
+    Returns {broken: [...], errors: [...], healthy_count: int}."""
+    broken = []    # deactivated/unauthorized — will auto-disable
+    errors = []    # network/api failures — manual check
+    healthy = 0
+
+    try:
+        accounts = dm.list_accounts(include_disabled=False)
+    except Exception as e:
+        logger.error("Watchdog AT: list_accounts failed: %s", e)
+        return {"broken": [], "errors": [{"email": "(list_accounts)", "error": str(e)}],
+                "healthy_count": 0}
+
+    for acc in accounts:
+        tc = (acc.get("token_context") or "").lower()
+        at = acc.get("access_token") or ""
+        email = (acc.get("email") or "").lower()
+        if tc != "team" or not at or len(at) < 100:
+            continue
+
+        try:
+            r = dm.verify_token(at)
+        except Exception as e:
+            if email not in _at_error_alerted:
+                _at_error_alerted.add(email)
+                errors.append({"email": email, "acc_id": acc.get("id"),
+                               "error": f"exception: {e}"})
+            continue
+
+        if r.get("ok"):
+            healthy += 1
+            _at_failed_alerted.discard(email)
+            _at_error_alerted.discard(email)
+            continue
+
+        http_status = r.get("status", 0)
+        reason = r.get("reason", "")
+        is_fatal = (http_status == 401 or
+                    reason in ("unauthorized", "account_deactivated",
+                               "token_invalidated", "forbidden"))
+
+        if is_fatal:
+            if email not in _at_failed_alerted:
+                _at_failed_alerted.add(email)
+                broken.append({
+                    "email": email,
+                    "acc_id": acc.get("id"),
+                    "category": acc.get("category", "?"),
+                    "status": http_status,
+                    "reason": reason,
+                })
+        else:
+            if email not in _at_error_alerted:
+                _at_error_alerted.add(email)
+                errors.append({
+                    "email": email,
+                    "acc_id": acc.get("id"),
+                    "error": f"HTTP {http_status} {reason}".strip(),
+                })
+
+    return {"broken": broken, "errors": errors, "healthy_count": healthy}
+
+
+async def _handle_deactivated(dm: DataManager, email: str) -> dict:
+    """Auto-disable a deactivated account in DM and delete from CPAB."""
+    acc = dm.find_account(email, include_disabled=True)
+    result = {"dm_disabled": False, "cpab_deleted": 0, "error": None}
+    if not acc:
+        result["error"] = "not_in_dm"
+        return result
+
+    try:
+        pr = dm.patch_account(acc["id"], {"status": "disabled"})
+        result["dm_disabled"] = pr.get("ok", False)
+    except Exception as e:
+        result["error"] = f"dm_patch: {e}"
+
+    try:
+        cpa = CPAAdmin(CFG["cpa_admin_base"], CFG["cpa_admin_user"],
+                       CFG["cpa_admin_password"])
+        if cpa.login():
+            files = cpa.list_auth_files()
+            auth_ids = [a["auth_id"] for a in cpa.collect_auth_ids_for_emails({email}, files)]
+            for aid in auth_ids:
+                if cpa.delete_auth_file(aid):
+                    result["cpab_deleted"] += 1
+    except Exception as e:
+        result["error"] = (result["error"] or "") + f" cpab: {e}"
+
+    return result
+
+
+async def _watchdog_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic: scan inbox for deactivation + verify team AT + auto-handle."""
+    chat_id = _watchdog_chat_id
+    if not chat_id:
+        return
+
+    otp_token = CFG.get("otp_token", "")
+    dm = DataManager(CFG["dm_base"], CFG["dm_token"])
+
+    # 1) Inbox scan
+    new_deact = await _scan_inbox_deactivation(otp_token)
+
+    action_lines = []
+    for d in new_deact:
+        actions = await _handle_deactivated(dm, d["email"])
+        tag = []
+        if actions["dm_disabled"]:
+            tag.append("DM disabled")
+        if actions["cpab_deleted"]:
+            tag.append(f"CPAB -{actions['cpab_deleted']}")
+        if actions["error"]:
+            tag.append(f"err: {actions['error']}")
+        if not actions["dm_disabled"] and not actions["cpab_deleted"]:
+            tag.append("not found")
+        action_lines.append(f"🔴 {d['email']}  [{', '.join(tag)}]\n   {d['subject']}")
+
+    # 2) Team AT verification
+    at_check = _verify_team_ats(dm)
+    broken_ats = at_check["broken"]
+    at_errors = at_check["errors"]
+
+    deact_emails = {d["email"] for d in new_deact}
+    for b in broken_ats:
+        if b["email"] in deact_emails:
+            continue
+        actions = await _handle_deactivated(dm, b["email"])
+        tag = [f"AT {b['status']}/{b.get('reason','')}".strip("/")]
+        if actions["dm_disabled"]:
+            tag.append("DM disabled")
+        if actions["cpab_deleted"]:
+            tag.append(f"CPAB -{actions['cpab_deleted']}")
+        action_lines.append(f"🔴 {b['email']} ({b['category']})  [{', '.join(tag)}]")
+
+    # 3) Compose notification
+    lines = []
+    if action_lines:
+        lines.append(f"🚨 Deactivation — {len(action_lines)} account(s)\n")
+        lines.extend(action_lines)
+    if at_errors:
+        lines.append(f"\n⚠️ AT verify errors — {len(at_errors)} (manual check)\n")
+        for e in at_errors[:10]:
+            lines.append(f"  {e['email']}: {e['error'][:80]}")
+        if len(at_errors) > 10:
+            lines.append(f"  ... +{len(at_errors) - 10} more")
+
+    if lines:
         try:
             await context.bot.send_message(chat_id, "\n".join(lines))
         except Exception as e:
-            logger.error("Watchdog: failed to send alert: %s", e)
+            logger.error("Watchdog: send alert failed: %s", e)
+    else:
+        logger.info("Watchdog: no issues — %d team ATs healthy",
+                    at_check["healthy_count"])
 
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1140,7 +1284,7 @@ def main():
     # Inline keyboard
     app.add_handler(CallbackQueryHandler(menu_callback))
 
-    # Set bot commands menu
+    # Set bot commands menu + auto-start watchdog for owner
     async def post_init(application):
         await application.bot.set_my_commands([
             ("auth", "Authenticate: /auth <password>"),
@@ -1167,6 +1311,24 @@ def main():
             ("mark_paid", "Mark paid: /mark_paid <email|link> [cat]"),
             ("proxy", "Proxy: /proxy [url]"),
         ])
+
+        # Auto-start watchdog: bind to owner's DM chat (chat_id == user_id for private chats)
+        global _watchdog_chat_id
+        _watchdog_chat_id = OWNER_ID
+        jq = application.job_queue
+        if jq:
+            for job in jq.get_jobs_by_name("deact_watchdog"):
+                job.schedule_removal()
+            jq.run_repeating(
+                _watchdog_job,
+                interval=_watchdog_interval,
+                first=30,  # first run 30s after boot
+                name="deact_watchdog",
+            )
+            logger.info("Watchdog auto-started: chat=%s, interval=%ds",
+                        OWNER_ID, _watchdog_interval)
+        else:
+            logger.warning("JobQueue unavailable — watchdog not started")
 
     app.post_init = post_init
 
