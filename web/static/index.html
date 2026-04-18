@@ -1503,12 +1503,25 @@ function renderSessionResult(r) {
   planBadge.textContent = r.plan_type || 'unknown';
   planBadge.className = 'badge badge-' + (r.plan_type === 'team' || r.plan_type === 'enterprise' ? 'done' : 'running');
 
+  const at = r.access_token || '';
   const fullJson = JSON.stringify(r, null, 2);
-  const safe = fullJson.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  fields.innerHTML = `<div class="copy-field">
-    <label>Session JSON <span style="color:var(--text-muted)">(click to copy)</span></label>
-    <div class="copy-val" style="max-height:500px" onclick="copyField(this, ${JSON.stringify(fullJson).replace(/"/g,'&quot;')})">${safe}</div>
-  </div>`;
+  const escape = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const atLen = at.length;
+  const fields_html = [];
+
+  if (at) {
+    fields_html.push(`<div class="copy-field">
+      <label>Access Token <span style="color:var(--text-tertiary)">(${atLen} chars · click to copy)</span></label>
+      <div class="copy-val" onclick="copyField(this, ${JSON.stringify(at).replace(/"/g,'&quot;')})">${escape(at)}</div>
+    </div>`);
+  }
+
+  fields_html.push(`<div class="copy-field">
+    <label>Session JSON <span style="color:var(--text-tertiary)">(click to copy)</span></label>
+    <div class="copy-val" style="max-height:500px" onclick="copyField(this, ${JSON.stringify(fullJson).replace(/"/g,'&quot;')})">${escape(fullJson)}</div>
+  </div>`);
+
+  fields.innerHTML = fields_html.join('');
 }
 
 function copyField(el, val) {
