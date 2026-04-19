@@ -809,16 +809,37 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _resolve_account_by_input(dm: DataManager, token: str) -> dict | None:
-    """Resolve an account from email, payment link, or access token."""
+    """Resolve an account from email, payment URL (checkout or success-team),
+    or access token. Payment URLs are matched by extracting cs_live_... session id
+    or account_id from query string."""
+    import re as _re
     token = token.strip()
 
     # 1) Email
     if "@" in token and "chatgpt.com" not in token:
         return dm.find_account(token, include_disabled=True)
 
-    # 2) Payment link (URL containing chatgpt.com/checkout)
-    if "chatgpt.com" in token or "checkout" in token:
+    # 2) Payment URL (checkout or payments/success-team)
+    if ("chatgpt.com" in token or "checkout" in token or
+        "cs_live_" in token or "cs_test_" in token):
+        m = _re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", token)
+        session_id = m.group(0) if m else ""
+        m = _re.search(r"[?&]account_id=([0-9a-fA-F-]{16,})", token)
+        account_id = m.group(1) if m else ""
+
         all_accs = dm.list_accounts(include_disabled=True)
+
+        if session_id:
+            for a in all_accs:
+                pl = a.get("payment_link") or ""
+                if pl and session_id in pl:
+                    return a
+
+        if account_id:
+            for a in all_accs:
+                if (a.get("team_account_id") or "").lower() == account_id.lower():
+                    return a
+
         for a in all_accs:
             pl = a.get("payment_link") or ""
             if pl and (token in pl or pl in token):

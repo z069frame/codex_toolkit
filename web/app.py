@@ -303,19 +303,68 @@ def _is_stopped(task_id: str) -> bool:
 #  Shared helpers — extracted for reuse across task runners and endpoints
 # ---------------------------------------------------------------------------
 
+def _parse_payment_url(url: str) -> dict:
+    """Extract identifiers from either checkout-URL or payments/success-team URL.
+    Returns {session_id, account_id} (any may be empty).
+
+    Supports:
+      - https://chatgpt.com/checkout/<processor>/cs_live_XXXXX
+      - https://chatgpt.com/payments/success-team?stripe_session_id=cs_live_XXXXX&account_id=UUID&...
+      - bare cs_live_XXXXX session id
+    """
+    out = {"session_id": "", "account_id": ""}
+    if not url:
+        return out
+    # Session id: 'cs_live_...' or 'cs_test_...' (alphanumerics after prefix)
+    m = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", url)
+    if m:
+        out["session_id"] = m.group(0)
+    # account_id from success URL query string
+    m = re.search(r"[?&]account_id=([0-9a-fA-F-]{16,})", url)
+    if m:
+        out["account_id"] = m.group(1)
+    return out
+
+
 def _resolve_account_by_input(dm: DataManager, target: str) -> dict | None:
-    """Resolve a DM account from email / payment-link / AT token."""
+    """Resolve a DM account from email / payment-link / success-URL / AT token."""
     t = (target or "").strip()
     if not t:
         return None
+
+    # 1) Email
     if "@" in t and "chatgpt.com" not in t:
         return dm.find_account(t, include_disabled=True)
-    if "chatgpt.com" in t or "checkout" in t:
-        for a in dm.list_accounts(include_disabled=True):
+
+    # 2) Payment URL — checkout or payments/success-team
+    if "chatgpt.com" in t or "checkout" in t or "cs_live_" in t or "cs_test_" in t:
+        parsed = _parse_payment_url(t)
+        session_id = parsed["session_id"]
+        account_id = parsed["account_id"]
+
+        accounts = dm.list_accounts(include_disabled=True)
+
+        # Primary: match session_id inside stored payment_link
+        if session_id:
+            for a in accounts:
+                pl = a.get("payment_link") or ""
+                if pl and session_id in pl:
+                    return a
+
+        # Fallback: match team_account_id (from success URL)
+        if account_id:
+            for a in accounts:
+                if (a.get("team_account_id") or "").lower() == account_id.lower():
+                    return a
+
+        # Legacy fallback: literal substring match
+        for a in accounts:
             pl = a.get("payment_link") or ""
             if pl and (t in pl or pl in t):
                 return a
         return None
+
+    # 3) Access token / JWT
     if len(t) > 100 and "." in t:
         claims = decode_jwt_claims(t)
         email = claims.get("https://api.openai.com/profile", {}).get("email", "")
