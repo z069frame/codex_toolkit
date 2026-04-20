@@ -15,6 +15,8 @@ _ENV_MAP = {
     "cpa_admin_password":   "CPA_ADMIN_PASSWORD",
     "cpa_mgmt_base":        "CPA_MGMT_BASE",
     "cpa_mgmt_bearer":      "CPA_MGMT_BEARER",
+    "cpa_plus_base":        "CPA_PLUS_BASE",
+    "cpa_plus_bearer":      "CPA_PLUS_BEARER",
     "dm_base":              "DM_BASE",
     "dm_token":             "DM_TOKEN",
     "oauth_client_id":      "OAUTH_CLIENT_ID",

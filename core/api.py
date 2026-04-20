@@ -210,6 +210,16 @@ class CPAAdmin:
 # ---------------------------------------------------------------------------
 
 class CPAMgmt:
+    """CLIProxyAPI Management client.
+
+    Serves both the free pool (cpa.lsai.uk) and the plus/team pool
+    (plus.cpa.lsai.uk). Shape differs from CPAAdmin:
+      - auth identifier is `name` (filename string), not numeric id
+      - list response is flat (email, id_token, provider on top level);
+        access_token is NOT in list — must be fetched via download endpoint
+      - no login flow — bearer is pre-set
+    """
+
     def __init__(self, base: str, bearer: str):
         self.base = base.rstrip("/")
         self.bearer = bearer
@@ -221,6 +231,8 @@ class CPAMgmt:
             "User-Agent": "Mozilla/5.0",
         }
 
+    # ── OAuth ─────────────────────────────────────────────────────────
+
     def get_oauth_url(self) -> dict:
         """GET /v0/management/codex-auth-url → {url, state}"""
         ok, st, d = _http(
@@ -228,6 +240,10 @@ class CPAMgmt:
             headers=self._headers(),
         )
         return {"ok": ok, "status": st, **d}
+
+    def start_oauth(self) -> dict:
+        """Alias for get_oauth_url — matches CPAAdmin's signature."""
+        return self.get_oauth_url()
 
     def oauth_callback(self, state: str, code: str) -> dict:
         ok, st, d = _http(
@@ -238,6 +254,8 @@ class CPAMgmt:
         )
         return {"ok": ok, "status": st, **d}
 
+    # ── List & fetch ──────────────────────────────────────────────────
+
     def list_auth_files(self) -> list:
         ok, st, d = _http(
             f"{self.base}/v0/management/auth-files",
@@ -246,6 +264,166 @@ class CPAMgmt:
         if not ok:
             return []
         return d.get("files") or d.get("auth_files") or d.get("data") or []
+
+    def download_auth_file(self, name: str) -> dict | None:
+        """GET /v0/management/auth-files/download?name=<name>
+        Returns the raw auth JSON: {type, email, access_token, refresh_token,
+        id_token, account_id, expired, ...} or None."""
+        import urllib.parse
+        ok, st, d = _http(
+            f"{self.base}/v0/management/auth-files/download?"
+            f"name={urllib.parse.quote(name)}",
+            headers=self._headers(),
+        )
+        return d if ok and isinstance(d, dict) else None
+
+    # ── Mutations ─────────────────────────────────────────────────────
+
+    def delete_auth_file(self, name: str) -> bool:
+        """DELETE /v0/management/auth-files?name=<name>
+
+        `name` is the filename (e.g. "codex-foo@bar-plus.json").
+        For compat with CPAAdmin callers passing int id: we just format it.
+        """
+        import urllib.parse
+        ok, st, d = _http(
+            f"{self.base}/v0/management/auth-files?"
+            f"name={urllib.parse.quote(str(name))}",
+            method="DELETE",
+            headers=self._headers(),
+        )
+        return ok or st in (200, 204)
+
+    def disable_auth_file(self, name: str, disabled: bool = True) -> bool:
+        """PATCH /v0/management/auth-files/status body {name, disabled}.
+        Alternative to delete — keeps file but marks it disabled."""
+        ok, st, d = _http(
+            f"{self.base}/v0/management/auth-files/status",
+            method="PATCH",
+            headers=self._headers(),
+            body={"name": str(name), "disabled": disabled},
+        )
+        return ok
+
+    def set_priority(self, name, priority: int = 100) -> bool:
+        """PATCH /v0/management/auth-files/fields body {name, priority}."""
+        ok, st, d = _http(
+            f"{self.base}/v0/management/auth-files/fields",
+            method="PATCH",
+            headers=self._headers(),
+            body={"name": str(name), "priority": priority},
+        )
+        return ok
+
+    # ── Client-side helpers (match CPAAdmin shape) ────────────────────
+
+    def find_auth_by_email(self, email: str) -> dict | None:
+        """Return best codex auth-file for email (prefer team plans).
+        Returns a dict with {id(=name), email, plan_type, auth_index,
+        has_at/has_rt (unknown in list endpoint — False), name}."""
+        files = self.list_auth_files()
+        email_lower = email.lower()
+        matches = []
+        for f in files:
+            femail = (f.get("email") or f.get("account") or "").lower()
+            if femail != email_lower:
+                continue
+            if (f.get("provider") or f.get("type") or "").lower() != "codex":
+                continue
+            id_token = f.get("id_token") or {}
+            if isinstance(id_token, str):
+                id_token = {}
+            plan = (id_token.get("plan_type") or "").lower() or "unknown"
+            name = f.get("name") or f.get("id") or ""
+            matches.append({
+                "id": name,           # compat: callers use .get("id")
+                "name": name,
+                "email": femail,
+                "plan_type": plan,
+                "auth_index": f.get("auth_index", ""),
+                "disabled": bool(f.get("disabled", False)),
+                # list endpoint doesn't expose token values; mark unknown
+                "has_at": True,       # presence of entry implies AT exists
+                "has_rt": True,
+            })
+        if not matches:
+            return None
+        team = [m for m in matches if m["plan_type"] in ("team", "enterprise", "business")]
+        if team:
+            return team[0]
+        return matches[0]
+
+    def extract_codex_auths(self, files: list | None = None,
+                            fetch_access_token: bool = False) -> list:
+        """Extract & dedup codex auth entries.
+        Returns list of {email, name, auth_id=name, plan_type,
+        auth_index, disabled, access_token (None unless fetch_access_token)}.
+
+        Dedup by (email, plan_type), keeping the lexicographically largest
+        filename (usually the most recent)."""
+        if files is None:
+            files = self.list_auth_files()
+        by_key = {}
+        for f in files:
+            if (f.get("provider") or f.get("type") or "").lower() != "codex":
+                continue
+            email = (f.get("email") or f.get("account") or "").strip().lower()
+            name = f.get("name") or f.get("id", "")
+            if not email or not name:
+                continue
+            id_token = f.get("id_token") or {}
+            if isinstance(id_token, str):
+                id_token = {}
+            plan = (id_token.get("plan_type") or "").lower() or "unknown"
+            key = (email, plan)
+            if key not in by_key or name > by_key[key]["name"]:
+                by_key[key] = {
+                    "email": email,
+                    "name": name,
+                    "auth_id": name,  # compat alias
+                    "plan_type": plan,
+                    "auth_index": f.get("auth_index", ""),
+                    "disabled": bool(f.get("disabled", False)),
+                    "access_token": None,
+                }
+        results = list(by_key.values())
+
+        # Optionally fetch the real AT from download endpoint (slow — N requests)
+        if fetch_access_token:
+            for r in results:
+                raw = self.download_auth_file(r["name"])
+                if raw:
+                    r["access_token"] = raw.get("access_token") or ""
+                    r["refresh_token"] = raw.get("refresh_token") or ""
+        return results
+
+    def collect_auth_ids_for_emails(self, emails: set, files: list | None = None) -> list:
+        """For each matching email, return {email, auth_id=name, name}.
+        Multiple entries per email are included (one per workspace/plan)."""
+        if files is None:
+            files = self.list_auth_files()
+        result = []
+        emails_lower = {e.lower() for e in emails}
+        for f in files:
+            if (f.get("provider") or f.get("type") or "").lower() != "codex":
+                continue
+            femail = (f.get("email") or f.get("account") or "").strip().lower()
+            if femail in emails_lower:
+                name = f.get("name") or f.get("id", "")
+                result.append({"email": femail, "auth_id": name, "name": name})
+        return result
+
+    def has_team_auth_for_email(self, email: str) -> bool:
+        files = self.list_auth_files()
+        email_lower = email.lower()
+        for f in files:
+            femail = (f.get("email") or f.get("account") or "").lower()
+            if femail != email_lower:
+                continue
+            plan = ((f.get("id_token") or {}).get("plan_type") or "").lower()
+            if plan in ("team", "enterprise", "business"):
+                return True
+        return False
 
 
 # ---------------------------------------------------------------------------

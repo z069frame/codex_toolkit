@@ -445,7 +445,7 @@ def _writeback_one(dm: DataManager, acc: dict, proxy: str | None,
             "account_id": account_id, "token_context": new_tc}
 
 
-def _oauth_multi_one(cpa_admin: CPAAdmin, email: str, password: str,
+def _oauth_multi_one(cpa_admin: CPAMgmt, email: str, password: str,
                       otp_token: str, proxy: str | None,
                       workspace_filter: list | None,
                       writeback: bool, dm: DataManager | None,
@@ -509,26 +509,27 @@ def _oauth_multi_one(cpa_admin: CPAAdmin, email: str, password: str,
 
         # DM writeback for this specific workspace
         if writeback and auth and dm:
+            # CPA-management schema: list returns flat entries with
+            # id_token (parsed JWT claims, incl. chatgpt_account_id) but
+            # NOT access_token. Match by workspace id on id_token, then
+            # download the matching file to extract the raw AT.
             cpab_at = None
             fresh_files = cpa_admin.list_auth_files()
             for ff in fresh_files:
-                fc = ff.get("content") or {}
-                if isinstance(fc, str):
-                    try:
-                        fc = json.loads(fc)
-                    except Exception:
-                        continue
-                if (fc.get("email") or "").lower() != email.lower():
+                if (ff.get("email") or ff.get("account") or "").lower() != email.lower():
                     continue
-                if "codex" not in (fc.get("type") or "").lower():
+                if (ff.get("provider") or ff.get("type") or "").lower() != "codex":
                     continue
-                ff_at = fc.get("access_token", "")
-                if not ff_at or len(ff_at) < 100:
-                    continue
-                ff_claims = decode_jwt_claims(ff_at)
-                ff_aid = ff_claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id", "")
+                id_token = ff.get("id_token") or {}
+                if isinstance(id_token, str):
+                    id_token = {}
+                ff_aid = id_token.get("chatgpt_account_id", "")
                 if ff_aid == ws_id:
-                    cpab_at = ff_at
+                    raw = cpa_admin.download_auth_file(ff.get("name") or ff.get("id", ""))
+                    if raw:
+                        ff_at = raw.get("access_token", "")
+                        if ff_at and len(ff_at) > 100:
+                            cpab_at = ff_at
                     break
 
             if cpab_at:
@@ -951,13 +952,8 @@ def _run_oauth(task_id: str, req: SingleEmailReq):
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
-    cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"], cfg["cpa_admin_password"])
-
-    # Login CPA admin first
-    if not cpa_admin.login():
-        _log(task_id, "❌ CPA admin login failed")
-        _finish(task_id, {"ok": False, "error": "cpa_admin_login_failed"}, "error")
-        return
+    # Team pool now on plus.cpa.lsai.uk (CPA-management API, not CPAB)
+    cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
 
     if req.email:
         acc = dm.find_account(req.email)
@@ -1038,12 +1034,7 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
     proxy = _get_proxy(req.proxy, "oauth-multi")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
-    cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"], cfg["cpa_admin_password"])
-
-    if not cpa_admin.login():
-        _log(task_id, "❌ CPA admin login failed")
-        _finish(task_id, {"ok": False, "error": "cpa_admin_login_failed"}, "error")
-        return
+    cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
 
     email = req.email.strip()
     if not email:
@@ -1118,26 +1109,27 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
 
         # DM writeback (only if --writeback requested)
         if req.writeback and auth:
+            # CPA-management schema: list returns flat entries with
+            # id_token (parsed JWT claims, incl. chatgpt_account_id) but
+            # NOT access_token. Match by workspace id on id_token, then
+            # download the matching file to extract the raw AT.
             cpab_at = None
             fresh_files = cpa_admin.list_auth_files()
             for ff in fresh_files:
-                fc = ff.get("content") or {}
-                if isinstance(fc, str):
-                    try:
-                        fc = json.loads(fc)
-                    except Exception:
-                        continue
-                if (fc.get("email") or "").lower() != email.lower():
+                if (ff.get("email") or ff.get("account") or "").lower() != email.lower():
                     continue
-                if "codex" not in (fc.get("type") or "").lower():
+                if (ff.get("provider") or ff.get("type") or "").lower() != "codex":
                     continue
-                ff_at = fc.get("access_token", "")
-                if not ff_at or len(ff_at) < 100:
-                    continue
-                ff_claims = decode_jwt_claims(ff_at)
-                ff_aid = ff_claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id", "")
+                id_token = ff.get("id_token") or {}
+                if isinstance(id_token, str):
+                    id_token = {}
+                ff_aid = id_token.get("chatgpt_account_id", "")
                 if ff_aid == ws_id:
-                    cpab_at = ff_at
+                    raw = cpa_admin.download_auth_file(ff.get("name") or ff.get("id", ""))
+                    if raw:
+                        ff_at = raw.get("access_token", "")
+                        if ff_at and len(ff_at) > 100:
+                            cpab_at = ff_at
                     break
 
             if cpab_at:
@@ -1253,32 +1245,26 @@ def _run_subscribe_flow(task_id: str, req: SubscribeFlowReq):
             _finish(task_id, {"ok": False, "email": email, "steps": steps,
                               "error": "stopped"}, "stopped")
             return
-        cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"],
-                             cfg["cpa_admin_password"])
-        if not cpa_admin.login():
-            _log(task_id, f"  ❌ CPA admin login failed")
-            steps.append({"name": "oauth_multi", "ok": False,
-                          "detail": "cpa_admin_login_failed"})
+        cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
+        om = _oauth_multi_one(
+            cpa_admin=cpa_admin, email=email,
+            password=password, otp_token=otp_token, proxy=proxy,
+            workspace_filter=None,
+            writeback=req.dm_writeback, dm=dm,
+            log_fn=lambda m: _log(task_id, m),
+        )
+        if om["ok"]:
+            n_ok = sum(1 for r in om["results"] if r["ok"])
+            n_total = len(om["results"])
+            _log(task_id, f"  Summary: {n_ok}/{n_total} workspaces OAuth'd")
+            steps.append({"name": "oauth_multi", "ok": n_ok > 0,
+                          "detail": f"{n_ok}/{n_total} workspaces",
+                          "workspaces": om["workspaces"],
+                          "results": om["results"]})
         else:
-            om = _oauth_multi_one(
-                cpa_admin=cpa_admin, email=email,
-                password=password, otp_token=otp_token, proxy=proxy,
-                workspace_filter=None,
-                writeback=req.dm_writeback, dm=dm,
-                log_fn=lambda m: _log(task_id, m),
-            )
-            if om["ok"]:
-                n_ok = sum(1 for r in om["results"] if r["ok"])
-                n_total = len(om["results"])
-                _log(task_id, f"  Summary: {n_ok}/{n_total} workspaces OAuth'd")
-                steps.append({"name": "oauth_multi", "ok": n_ok > 0,
-                              "detail": f"{n_ok}/{n_total} workspaces",
-                              "workspaces": om["workspaces"],
-                              "results": om["results"]})
-            else:
-                _log(task_id, f"  ❌ {om.get('error','?')}")
-                steps.append({"name": "oauth_multi", "ok": False,
-                              "detail": om.get("error", "?")})
+            _log(task_id, f"  ❌ {om.get('error','?')}")
+            steps.append({"name": "oauth_multi", "ok": False,
+                          "detail": om.get("error", "?")})
     else:
         _log(task_id, f"[3/3] ⏭️ OAuth Multi-WS skipped")
 
@@ -1477,32 +1463,32 @@ def _run_health_check(task_id: str, req: HealthCheckReq):
     otp_token = cfg["otp_token"]
     dry_run = req.dry_run
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
-    cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"], cfg["cpa_admin_password"])
+    # Team pool on plus.cpa.lsai.uk — CPA-management API
+    cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
 
     if dry_run:
         _log(task_id, "⚠️ DRY-RUN mode — no deletions will be performed")
 
-    # 1) CPAB login
-    if not cpa_admin.login():
-        _log(task_id, "❌ CPA admin login failed")
-        _finish(task_id, {"ok": False, "error": "cpa_admin_login_failed"}, "error")
-        return
-
-    # 2) List & dedup
-    _log(task_id, "Fetching CPAB auth-files...")
+    # 1) List & dedup (access_token fetched per entry — CPA list lacks it)
+    _log(task_id, "Fetching CPA auth-files...")
     files = cpa_admin.list_auth_files()
-    auths = cpa_admin.extract_codex_auths(files)
+    auths = cpa_admin.extract_codex_auths(files, fetch_access_token=True)
     if not auths:
         _log(task_id, "⏭️ No codex auth entries found")
         _finish(task_id, {"ok": True, "total": 0}, "done")
         return
     _log(task_id, f"Found {len(auths)} codex auth entries (deduplicated)")
 
-    # 3) Verify each token via DM
+    # 2) Verify each token via DM
     _log(task_id, "Verifying tokens via DM...")
 
     def _check_one(auth):
-        r = dm.verify_token(auth["access_token"])
+        at = auth.get("access_token") or ""
+        if not at:
+            return {"email": auth["email"], "auth_id": auth["auth_id"],
+                    "plan_type": auth.get("plan_type", "unknown"),
+                    "ok": False, "reason": "no_access_token", "http_status": 0}
+        r = dm.verify_token(at)
         return {
             "email": auth["email"],
             "auth_id": auth["auth_id"],
@@ -1597,18 +1583,12 @@ def _run_deactivation_scan(task_id: str, req: DeactivationScanReq):
     otp_token = cfg["otp_token"]
     dry_run = req.dry_run
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
-    cpa_admin = CPAAdmin(cfg["cpa_admin_base"], cfg["cpa_admin_user"], cfg["cpa_admin_password"])
+    cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
 
     if dry_run:
         _log(task_id, "⚠️ DRY-RUN mode — no deletions or disables will be performed")
 
-    # 1) CPAB login
-    if not cpa_admin.login():
-        _log(task_id, "❌ CPA admin login failed")
-        _finish(task_id, {"ok": False, "error": "cpa_admin_login_failed"}, "error")
-        return
-
-    # 2) List DM accounts
+    # 1) List DM accounts
     _log(task_id, "Fetching DM accounts...")
     all_accounts = dm.list_accounts(include_disabled=False)
     if not all_accounts:

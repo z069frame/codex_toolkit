@@ -1185,16 +1185,14 @@ async def _handle_deactivated(dm: DataManager, email: str) -> dict:
             result["error"] = f"dm_patch: {e}"
 
     try:
-        cpa = CPAAdmin(CFG["cpa_admin_base"], CFG["cpa_admin_user"],
-                       CFG["cpa_admin_password"])
-        if cpa.login():
-            files = cpa.list_auth_files()
-            auth_ids = [a["auth_id"] for a in cpa.collect_auth_ids_for_emails({email}, files)]
-            for aid in auth_ids:
-                if cpa.delete_auth_file(aid):
-                    result["cpab_deleted"] += 1
+        cpa = CPAMgmt(CFG["cpa_plus_base"], CFG["cpa_plus_bearer"])
+        files = cpa.list_auth_files()
+        auth_ids = [a["auth_id"] for a in cpa.collect_auth_ids_for_emails({email}, files)]
+        for aid in auth_ids:
+            if cpa.delete_auth_file(aid):
+                result["cpab_deleted"] += 1
     except Exception as e:
-        result["error"] = (result["error"] or "") + f" cpab: {e}"
+        result["error"] = (result["error"] or "") + f" cpa: {e}"
 
     return result
 
