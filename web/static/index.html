@@ -688,6 +688,9 @@
               <option value="free">free</option>
             </select>
           </div>
+          <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+            <input type="checkbox" id="of-dry-run"><label for="of-dry-run" style="cursor:pointer; text-transform:none; letter-spacing:0">Dry Run (preview)</label>
+          </div>
           <button class="btn btn-primary" onclick="doOAuthFree()">Start OAuth-Free</button>
         </div>
       </div>
@@ -1304,6 +1307,7 @@ function doOAuthFree() {
     email: document.getElementById('of-email').value || null,
     count: parseInt(document.getElementById('of-count').value) || 0,
     category: document.getElementById('of-category').value || null,
+    dry_run: document.getElementById('of-dry-run').checked,
   }, 'of');
 }
 

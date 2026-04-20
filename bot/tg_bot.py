@@ -372,13 +372,25 @@ async def cmd_oauth(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_oauth_free(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /oauth_free [email] [count] [category] [dry]"""
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
-    email = args[0] if args else None
-    count = int(args[1]) if len(args) > 1 else 0
-    cat = args[2] if len(args) > 2 else None
-    req = OAuthFreeReq(email=email, count=count, category=cat)
+    email = None
+    count = 0
+    cat = None
+    dry = False
+    for a in args:
+        al = a.lower()
+        if al == "dry" or al == "dry_run" or al == "preview":
+            dry = True
+        elif "@" in a:
+            email = a
+        elif a.isdigit():
+            count = int(a)
+        else:
+            cat = a
+    req = OAuthFreeReq(email=email, count=count, category=cat, dry_run=dry)
     await _run_task_and_report(update, context, "oauth-free", req, _run_oauth_free)
 
 

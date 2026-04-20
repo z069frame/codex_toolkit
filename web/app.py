@@ -198,6 +198,7 @@ class OAuthFreeReq(BaseModel):
     count: int = 0
     category: Optional[str] = None
     proxy: Optional[str] = None
+    dry_run: bool = False  # preview only, no OAuth
 
 
 class ProxyReq(BaseModel):
@@ -1291,6 +1292,41 @@ def _run_subscribe_flow(task_id: str, req: SubscribeFlowReq):
     })
 
 
+def _scan_deactivated_emails_bulk(otp_token: str, workers: list | None = None,
+                                    max_pages: int = 20) -> set:
+    """Scan worker inboxes in bulk, return set of emails that received
+    OpenAI deactivation notices. Much faster than per-email check_deactivated
+    when scanning many accounts at once."""
+    import urllib.request
+    workers = workers or ["zrfr.dpdns.org", "aitech.email"]  # one per CF worker
+    deactivated: set = set()
+
+    for domain in workers:
+        page = 0
+        while page < max_pages:
+            offset = page * 100
+            url = f"https://m.{domain}/api/emails?limit=100&offset={offset}"
+            try:
+                req = urllib.request.Request(url, headers={
+                    "Authorization": f"Bearer {otp_token}"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = json.loads(r.read())
+            except Exception as e:
+                logger.warning("bulk scan %s page %d: %s", domain, page, e)
+                break
+            items = data if isinstance(data, list) else (data.get("items") or data.get("data") or [])
+            if not items:
+                break
+            for msg in items:
+                subj = (msg.get("subject") or "").lower()
+                if "deactivated" in subj and "openai" in subj:
+                    rcpt = (msg.get("rcpt_to") or "").lower()
+                    if rcpt:
+                        deactivated.add(rcpt)
+            page += 1
+    return deactivated
+
+
 def _run_oauth_free(task_id: str, req: OAuthFreeReq):
     cfg = CFG
     proxy = _get_proxy(req.proxy, "oauth-free")
@@ -1298,6 +1334,9 @@ def _run_oauth_free(task_id: str, req: OAuthFreeReq):
     otp_token = cfg["otp_token"]
     cpa_mgmt = CPAMgmt(cfg["cpa_mgmt_base"], cfg["cpa_mgmt_bearer"])
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
+
+    if req.dry_run:
+        _log(task_id, "⚠️ DRY-RUN mode — no OAuth will be performed")
 
     # Collect existing free CPA emails
     _log(task_id, "Fetching free CPA auth files...")
@@ -1318,17 +1357,26 @@ def _run_oauth_free(task_id: str, req: OAuthFreeReq):
             return
         all_accounts = [acc]
     else:
-        all_accounts = dm.list_accounts()
-        _log(task_id, f"DM has {len(all_accounts)} accounts total")
+        # Don't include disabled accounts — they're not worth OAuth-ing
+        all_accounts = dm.list_accounts(include_disabled=False)
+        _log(task_id, f"DM has {len(all_accounts)} non-disabled accounts")
 
-    # Filter: category, not already in free CPA
+    # Pre-filter: category, status, already in CPA
     cat_filter = req.category.lower() if req.category else None
     pre_candidates = []
     skipped_cat = 0
     skipped_cpa = 0
+    skipped_status = 0
     for acc in all_accounts:
         email = (acc.get("email") or "").lower()
         cat = (acc.get("category") or "").strip().lower()
+        st = (acc.get("status") or "").strip().lower()
+        sub = (acc.get("subscription_status") or "").strip().lower()
+
+        # Skip explicitly bad states
+        if st == "disabled" or sub == "deactivated":
+            skipped_status += 1
+            continue
         if cat_filter and cat != cat_filter:
             skipped_cat += 1
             continue
@@ -1338,6 +1386,8 @@ def _run_oauth_free(task_id: str, req: OAuthFreeReq):
         pre_candidates.append(acc)
 
     filters = []
+    if skipped_status:
+        filters.append(f"{skipped_status} disabled/deactivated")
     if skipped_cat:
         filters.append(f"{skipped_cat} category mismatch")
     if skipped_cpa:
@@ -1347,17 +1397,23 @@ def _run_oauth_free(task_id: str, req: OAuthFreeReq):
 
     if not pre_candidates:
         _log(task_id, "⏭️ No candidates to process")
-        _finish(task_id, [], "done")
+        _finish(task_id, {"ok": True, "dry_run": req.dry_run,
+                          "alive": 0, "deactivated": 0, "processed": 0,
+                          "results": []}, "done")
         return
 
-    # Check deactivated status
-    _log(task_id, f"Checking deactivated status for {len(pre_candidates)} accounts...")
+    # Batched inbox scan: find all deactivated emails in one sweep
+    _log(task_id, f"Bulk-scanning worker inboxes for deactivation notices...")
+    deact_set = _scan_deactivated_emails_bulk(otp_token)
+    _log(task_id, f"Found {len(deact_set)} deactivated emails across all inboxes")
+
+    # Filter by deactivated set (fallback to per-email check if email has
+    # a domain not in the bulk-scanned workers)
     candidates = []
     deactivated_count = 0
     for acc in pre_candidates:
-        email = acc.get("email", "")
-        result = check_deactivated(email, otp_token)
-        if result.get("deactivated"):
+        email = (acc.get("email") or "").lower()
+        if email in deact_set:
             deactivated_count += 1
         else:
             candidates.append(acc)
@@ -1378,9 +1434,26 @@ def _run_oauth_free(task_id: str, req: OAuthFreeReq):
     if count > 0:
         candidates = candidates[:count]
 
+    if req.dry_run:
+        preview = [{"email": a.get("email"),
+                    "category": a.get("category", "?"),
+                    "status": a.get("status", "?"),
+                    "token_context": a.get("token_context", "?")}
+                   for a in candidates]
+        _log(task_id, f"DRY-RUN: {len(candidates)} accounts would be OAuth'd")
+        _finish(task_id, {"ok": True, "dry_run": True,
+                          "alive": len(candidates),
+                          "deactivated": deactivated_count,
+                          "would_process": len(candidates),
+                          "preview": preview[:50]}, "done")
+        return
+
     _log(task_id, f"Processing {len(candidates)} accounts for free CPA OAuth")
     results = []
     for i, acc in enumerate(candidates):
+        if _is_stopped(task_id):
+            _log(task_id, "🛑 stopped")
+            break
         email = acc.get("email", "")
         category = acc.get("category", "?")
         _log(task_id, f"[{i+1}/{len(candidates)}] OAuth-Free: {email} (cat={category})")
@@ -1393,7 +1466,8 @@ def _run_oauth_free(task_id: str, req: OAuthFreeReq):
 
     ok_count = sum(1 for r in results if r["ok"])
     _log(task_id, f"Summary: {ok_count}/{len(results)} succeeded")
-    _finish(task_id, results)
+    _finish(task_id, results,
+            "stopped" if _is_stopped(task_id) else "done")
 
 
 def _run_health_check(task_id: str, req: HealthCheckReq):
