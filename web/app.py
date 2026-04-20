@@ -507,8 +507,10 @@ def _oauth_multi_one(cpa_admin: CPAMgmt, email: str, password: str,
         dm_written = False
         if auth:
             auth_id = auth.get("id")
+            # Auto-configure: priority=100 + websockets=on for new team auths
             cpa_admin.set_priority(auth_id, 100)
-            log_fn(f"     auth_id={auth_id} priority set")
+            ws_ok = cpa_admin.set_websockets(auth_id, True)
+            log_fn(f"     auth_id={auth_id} priority=100, websockets={'on' if ws_ok else 'set-failed'}")
 
         # DM writeback for this specific workspace
         if writeback and auth and dm:

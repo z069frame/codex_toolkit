@@ -307,13 +307,55 @@ class CPAMgmt:
 
     def set_priority(self, name, priority: int = 100) -> bool:
         """PATCH /v0/management/auth-files/fields body {name, priority}."""
+        return self.patch_fields(name, priority=priority)
+
+    def patch_fields(self, name, priority: int | None = None,
+                      note: str | None = None,
+                      proxy_url: str | None = None,
+                      prefix: str | None = None,
+                      headers: dict | None = None) -> bool:
+        """PATCH /v0/management/auth-files/fields — bulk field update."""
+        body = {"name": str(name)}
+        if priority is not None: body["priority"] = priority
+        if note is not None: body["note"] = note
+        if proxy_url is not None: body["proxy_url"] = proxy_url
+        if prefix is not None: body["prefix"] = prefix
+        if headers is not None: body["headers"] = headers
         ok, st, d = _http(
             f"{self.base}/v0/management/auth-files/fields",
             method="PATCH",
             headers=self._headers(),
-            body={"name": str(name), "priority": priority},
+            body=body,
         )
         return ok
+
+    def set_websockets(self, name: str, enabled: bool = True) -> bool:
+        """Enable/disable the `websockets` flag inside the auth file JSON.
+        CLIProxyAPI has no dedicated field endpoint for this — the flag is
+        part of the file content. We download, modify, re-upload."""
+        import urllib.parse, urllib.request
+        raw = self.download_auth_file(name)
+        if not isinstance(raw, dict):
+            return False
+        if raw.get("websockets") == enabled:
+            return True  # already matches
+        raw["websockets"] = enabled
+
+        # POST with raw JSON body + ?name=X (non-multipart path)
+        url = (f"{self.base}/v0/management/auth-files?"
+               f"name={urllib.parse.quote(name)}")
+        body = json.dumps(raw).encode("utf-8")
+        req = urllib.request.Request(url, method="POST", data=body, headers={
+            "Authorization": f"Bearer {self.bearer}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return r.status == 200
+        except Exception as e:
+            logger.warning("set_websockets %s failed: %s", name, e)
+            return False
 
     # ── Client-side helpers (match CPAAdmin shape) ────────────────────
 

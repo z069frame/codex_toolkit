@@ -434,6 +434,90 @@ async def cmd_deactivation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_task_and_report(update, context, "deactivation-scan", req, _run_deactivation_scan)
 
 
+async def cmd_cpa_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Configure per-auth-file settings on CPA-plus.
+    Usage:
+      /cpa_config <email|name> [priority=N] [ws=on|off] [note=TEXT] [disable=on|off]
+    Examples:
+      /cpa_config noah260413077@aitech.email priority=100 ws=on
+      /cpa_config codex-xxx-team.json disable=on
+      /cpa_config email@example.com          (show current state)
+    """
+    if not _auth_check(update):
+        return await _denied(update)
+    args = context.args or []
+    if not args:
+        return await update.message.reply_text(
+            "Usage: /cpa_config <email|name> [priority=N] [ws=on|off] [note=TEXT] [disable=on|off]")
+
+    target = args[0]
+    opts = {}
+    for a in args[1:]:
+        if "=" in a:
+            k, v = a.split("=", 1)
+            opts[k.strip().lower()] = v.strip()
+
+    cpa = CPAMgmt(CFG["cpa_plus_base"], CFG["cpa_plus_bearer"])
+    files = cpa.list_auth_files()
+
+    # Resolve name: exact name match or by email
+    name = None
+    match = None
+    for f in files:
+        nn = f.get("name") or f.get("id", "")
+        if nn == target:
+            name = nn; match = f; break
+    if not name:
+        for f in files:
+            if (f.get("email") or f.get("account") or "").lower() == target.lower():
+                name = f.get("name") or f.get("id", "")
+                match = f
+                break
+    if not name:
+        return await update.message.reply_text(f"❌ No CPA-plus auth file found for: {target}")
+
+    # If no opts, just show current
+    if not opts:
+        raw = cpa.download_auth_file(name)
+        ws = raw.get("websockets") if raw else "?"
+        return await update.message.reply_text(
+            f"📄 {name}\n"
+            f"  email:      {match.get('email', '?')}\n"
+            f"  priority:   {match.get('priority', '(none)')}\n"
+            f"  disabled:   {match.get('disabled', False)}\n"
+            f"  note:       {match.get('note', '(none)')}\n"
+            f"  websockets: {ws}\n"
+            f"  plan:       {(match.get('id_token') or {}).get('plan_type', '?')}\n"
+            f"  status:     {match.get('status', '?')}")
+
+    lines = [f"⚙️ Config {name}:"]
+
+    # Disable toggle (via status endpoint)
+    if "disable" in opts:
+        val = opts["disable"].lower() in ("on", "true", "1", "yes")
+        ok = cpa.disable_auth_file(name, val)
+        lines.append(f"  {'✅' if ok else '❌'} disable={val}")
+
+    # Fields PATCH: priority + note
+    field_opts = {}
+    if "priority" in opts:
+        try: field_opts["priority"] = int(opts["priority"])
+        except ValueError: lines.append(f"  ❌ priority must be int, got {opts['priority']}")
+    if "note" in opts:
+        field_opts["note"] = opts["note"]
+    if field_opts:
+        ok = cpa.patch_fields(name, **field_opts)
+        lines.append(f"  {'✅' if ok else '❌'} {', '.join(f'{k}={v}' for k,v in field_opts.items())}")
+
+    # Websockets (requires download + re-upload)
+    if "ws" in opts or "websockets" in opts:
+        val = (opts.get("ws") or opts.get("websockets", "")).lower() in ("on", "true", "1", "yes")
+        ok = cpa.set_websockets(name, val)
+        lines.append(f"  {'✅' if ok else '❌'} websockets={val}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _auth_check(update):
         return await _denied(update)
@@ -1378,6 +1462,7 @@ def main():
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("deactivation", cmd_deactivation))
     app.add_handler(CommandHandler("invite", cmd_invite))
+    app.add_handler(CommandHandler("cpa_config", cmd_cpa_config))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
@@ -1410,6 +1495,7 @@ def main():
             ("health", "Health check: /health [dry]"),
             ("deactivation", "Deact scan: /deactivation [cat]"),
             ("invite", "Invite: /invite <src> <target>"),
+            ("cpa_config", "CPA config: /cpa_config <email> priority=N ws=on"),
             ("accounts", "Search: /accounts [query]"),
             ("tasks", "Recent tasks"),
             ("deact", "Check deactivated: /deact <email> ..."),
