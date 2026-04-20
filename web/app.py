@@ -62,8 +62,11 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
-    # Always allow: login endpoint, static files, index page (has login form)
-    if path in ("/", "/api/login") or path.startswith("/static/"):
+    # Always allow: login, static, index (has login form),
+    # and ACME HTTP-01 challenge path (for Let's Encrypt cert issuance)
+    if (path in ("/", "/api/login")
+        or path.startswith("/static/")
+        or path.startswith("/.well-known/")):
         return await call_next(request)
     # Check auth cookie
     if request.cookies.get(AUTH_COOKIE) != AUTH_TOKEN:
