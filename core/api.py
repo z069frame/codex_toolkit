@@ -329,6 +329,65 @@ class CPAMgmt:
         )
         return ok
 
+    def upload_codex_auth(self, email: str, access_token: str,
+                           refresh_token: str = "", id_token: str = "",
+                           account_id: str | None = None,
+                           plan: str | None = None,
+                           expires: str | None = None,
+                           websockets: bool = True) -> dict:
+        """Upload a codex auth file directly, bypassing OAuth.
+        Useful when the account can't complete Codex OAuth (phone-blocked)
+        but we already have a valid access_token from an alternate flow
+        (e.g. ChatGPT NextAuth session).
+
+        Missing fields are inferred from the AT's JWT claims when possible.
+        Returns {ok, name, status, error}."""
+        import datetime as _dt, urllib.parse, urllib.request
+
+        claims = decode_jwt_claims(access_token) or {}
+        auth_info = claims.get("https://api.openai.com/auth", {}) or {}
+        if not account_id:
+            account_id = auth_info.get("chatgpt_account_id", "") or ""
+        if not plan:
+            plan = (auth_info.get("chatgpt_plan_type", "") or "free").lower()
+        if not expires:
+            exp_ts = claims.get("exp")
+            if exp_ts:
+                expires = _dt.datetime.fromtimestamp(int(exp_ts), tz=_dt.timezone.utc).isoformat()
+            else:
+                expires = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=7)).isoformat()
+
+        name = f"codex-{email}-{plan}.json"
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        body = {
+            "type": "codex",
+            "email": email,
+            "expired": expires,
+            "id_token": id_token or "",
+            "account_id": account_id,
+            "access_token": access_token,
+            "last_refresh": now_iso,
+            "refresh_token": refresh_token or "",
+            "websockets": websockets,
+        }
+
+        url = (f"{self.base}/v0/management/auth-files?"
+               f"name={urllib.parse.quote(name)}")
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, method="POST", data=data, headers={
+            "Authorization": f"Bearer {self.bearer}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return {"ok": r.status == 200, "name": name, "status": r.status}
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "name": name, "status": e.code,
+                    "error": e.read().decode("utf-8", "ignore")[:500]}
+        except Exception as e:
+            return {"ok": False, "name": name, "error": str(e)}
+
     def set_websockets(self, name: str, enabled: bool = True) -> bool:
         """Enable/disable the `websockets` flag inside the auth file JSON.
         CLIProxyAPI has no dedicated field endpoint for this — the flag is
