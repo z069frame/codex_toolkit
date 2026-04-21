@@ -359,11 +359,18 @@ class CPAMgmt:
 
         name = f"codex-{email}-{plan}.json"
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        # When caller didn't supply an id_token (e.g. ChatGPT NextAuth session
+        # flow only yields an access_token), use the AT as id_token. Some
+        # consumers decode id_token to read `https://api.openai.com/auth.
+        # chatgpt_account_id` — an empty string makes quota/limit endpoints
+        # fail with "missing ChatGPT account ID". The AT carries the same
+        # claim structure for this purpose.
+        effective_id_token = id_token or access_token or ""
         body = {
             "type": "codex",
             "email": email,
             "expired": expires,
-            "id_token": id_token or "",
+            "id_token": effective_id_token,
             "account_id": account_id,
             "access_token": access_token,
             "last_refresh": now_iso,
