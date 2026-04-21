@@ -697,14 +697,36 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
     else:
         dm_res = dm.create_account(email, password, "", "", token_context="unknown")
     dm_ok = dm_res.get("ok", False)
-    _log(task_id, f"{'✅' if dm_ok else '⚠️'} {email}: DM {'ok' if dm_ok else 'failed'}")
+    if dm_ok:
+        _log(task_id, f"✅ {email}: DM ok")
+    else:
+        err_snippet = str(dm_res.get("error") or dm_res.get("raw") or dm_res)[:200]
+        _log(task_id, f"⚠️ {email}: DM failed — status={dm_res.get('status')} {err_snippet}")
 
-    # CPA OAuth
+    # CPA: prefer OAuth (for refresh_token), fallback to direct upload when
+    # phone-blocked or OAuth unavailable.
     cpa_ok = False
     if at:
-        cpa_res = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
-        cpa_ok = cpa_res.get("ok", False)
-        _log(task_id, f"{'✅' if cpa_ok else '⚠️'} {email}: CPA {'ok' if cpa_ok else 'failed'}")
+        if not phone_required:
+            cpa_res = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
+            cpa_ok = cpa_res.get("ok", False)
+            if cpa_ok:
+                _log(task_id, f"✅ {email}: CPA OAuth ok (with RT)")
+            else:
+                err = str(cpa_res.get("error", ""))
+                phone_related = any(x in err for x in (
+                    "no_code_extracted", "add_phone", "invalid_auth_step"))
+                if not phone_related:
+                    _log(task_id, f"⚠️ {email}: CPA OAuth failed: {err[:150]}")
+        if not cpa_ok:
+            up = cpa_mgmt.upload_codex_auth(email=email, access_token=at)
+            cpa_ok = up.get("ok", False)
+            if cpa_ok:
+                cpa_mgmt.set_priority(up["name"], 100)
+                cpa_mgmt.set_websockets(up["name"], True)
+                _log(task_id, f"✅ {email}: CPA upload {up['name']} (prio=100, ws=on; no RT)")
+            else:
+                _log(task_id, f"⚠️ {email}: CPA upload failed — {up.get('error') or up.get('status')}")
 
     return {"email": email, "ok": True, "phone_required": phone_required,
             "has_at": bool(at), "dm_ok": dm_ok, "cpa_ok": cpa_ok}
