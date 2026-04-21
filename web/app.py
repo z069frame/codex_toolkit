@@ -175,6 +175,34 @@ def _get_proxy(req_proxy: str | None = None, command: str | None = None) -> str 
 _load_saved_proxy()
 
 
+def _probe_egress_ip(proxy: str | None, timeout: int = 10) -> str:
+    """Get the outbound IP seen by the internet through `proxy`.
+
+    Used at the top of each register/session cycle to verify that
+    ProxySeller's residential rotation is actually giving us a fresh IP.
+    Never raises — returns a short diagnostic string on failure.
+    """
+    try:
+        from curl_cffi import requests as _cffi
+        s = _cffi.Session(impersonate="chrome136")
+        if proxy:
+            s.proxies = {"https": proxy, "http": proxy}
+        r = s.get("https://ipinfo.io/json", timeout=timeout)
+        if r.status_code == 200:
+            j = r.json()
+            ip = j.get("ip", "?")
+            loc = f"{j.get('city','?')}/{j.get('region','?')}/{j.get('country','?')}"
+            org = j.get("org", "")
+            # Trim ASN prefix for brevity: "AS701 Verizon Business" → "Verizon Business"
+            if org.startswith("AS"):
+                parts = org.split(" ", 1)
+                org = parts[1] if len(parts) > 1 else org
+            return f"{ip} ({loc}, {org})"
+        return f"probe_failed(HTTP {r.status_code})"
+    except Exception as e:
+        return f"probe_error({str(e)[:50]})"
+
+
 # ---------------------------------------------------------------------------
 #  Models
 # ---------------------------------------------------------------------------
@@ -651,7 +679,11 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
                   proxy, fixed_email, fixed_domain, idx_label: str) -> dict:
     """Register a single account. Shared by one-shot and loop modes."""
     email = fixed_email or generate_email(domains, domain=fixed_domain)
-    _log(task_id, f"{idx_label} Registering {email}")
+
+    # Probe the outbound IP through the same proxy — shows whether
+    # ProxySeller's rotation actually gives us a fresh IP per account.
+    egress_ip = _probe_egress_ip(proxy)
+    _log(task_id, f"{idx_label} Registering {email} | egress IP: {egress_ip}")
 
     reg = register_account(email=email, password=password, otp_token=otp_token,
                            client_id=client_id, redirect_uri=redirect_uri, proxy=proxy)
