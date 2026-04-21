@@ -188,6 +188,7 @@ class RegisterReq(BaseModel):
     loop: bool = False
     min_sleep: int = 30     # seconds
     max_sleep: int = 180    # seconds
+    debug: bool = False     # pipe core.* INFO logs into task log
 
 
 class SingleEmailReq(BaseModel):
@@ -734,6 +735,7 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
 
 def _run_register(task_id: str, req: RegisterReq):
     import random
+    import logging as _logging
 
     cfg = CFG
     proxy = _get_proxy(req.proxy, "register")
@@ -746,58 +748,81 @@ def _run_register(task_id: str, req: RegisterReq):
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
     cpa_mgmt = CPAMgmt(cfg["cpa_mgmt_base"], cfg["cpa_mgmt_bearer"])
 
+    # Debug mode: pipe core.* module logs into the task log
+    debug_handler = None
+    if getattr(req, "debug", False):
+        class _TaskLogHandler(_logging.Handler):
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    _log(task_id, f"🔍 {msg}")
+                except Exception:
+                    pass
+        debug_handler = _TaskLogHandler()
+        debug_handler.setLevel(_logging.INFO)
+        debug_handler.setFormatter(_logging.Formatter("%(name)s | %(message)s"))
+        for mod_name in ("core.chatgpt_session", "core.openai_auth", "core.otp"):
+            _logging.getLogger(mod_name).addHandler(debug_handler)
+            _logging.getLogger(mod_name).setLevel(_logging.INFO)
+        _log(task_id, "🔍 Debug log mirroring ON (core.*)")
+
     fixed_email = (req.email or "").strip() or None
     fixed_domain = (req.domain or "").strip().lstrip("@") or None
 
     results = []
 
-    if req.loop:
-        # ── Loop mode: register → random sleep → check stop → repeat ──
-        min_s = max(1, int(req.min_sleep or 30))
-        max_s = max(min_s, int(req.max_sleep or 180))
-        _log(task_id, f"🔁 Loop mode ON (sleep {min_s}-{max_s}s between accounts)")
+    try:
+        if req.loop:
+            # ── Loop mode: register → random sleep → check stop → repeat ──
+            min_s = max(1, int(req.min_sleep or 30))
+            max_s = max(min_s, int(req.max_sleep or 180))
+            _log(task_id, f"🔁 Loop mode ON (sleep {min_s}-{max_s}s between accounts)")
 
-        i = 0
-        while not _is_stopped(task_id):
-            i += 1
+            i = 0
+            while not _is_stopped(task_id):
+                i += 1
+                r = _register_one(task_id, req, dm, cpa_mgmt, password, otp_token,
+                                  client_id, redirect_uri, domains, proxy,
+                                  None, fixed_domain, f"[loop #{i}]")
+                results.append(r)
+
+                if _is_stopped(task_id):
+                    _log(task_id, "🛑 Stop requested — exiting loop")
+                    break
+
+                sleep_s = random.randint(min_s, max_s)
+                _log(task_id, f"😴 Sleeping {sleep_s}s before next account...")
+                # Sleep in 1s chunks so stop is responsive
+                for _ in range(sleep_s):
+                    if _is_stopped(task_id):
+                        _log(task_id, "🛑 Stop requested during sleep")
+                        break
+                    import time as _time
+                    _time.sleep(1)
+
+            ok_count = sum(1 for r in results if r["ok"])
+            _log(task_id, f"Loop ended: {ok_count}/{len(results)} registered over {i} iterations")
+            _finish(task_id, results, "stopped" if _is_stopped(task_id) else "done")
+            return
+
+        # ── One-shot mode ──
+        count = 1 if fixed_email else req.count
+        for i in range(count):
+            if _is_stopped(task_id):
+                _log(task_id, "🛑 Stop requested")
+                break
             r = _register_one(task_id, req, dm, cpa_mgmt, password, otp_token,
                               client_id, redirect_uri, domains, proxy,
-                              None, fixed_domain, f"[loop #{i}]")
+                              fixed_email, fixed_domain, f"[{i+1}/{count}]")
             results.append(r)
 
-            if _is_stopped(task_id):
-                _log(task_id, "🛑 Stop requested — exiting loop")
-                break
-
-            sleep_s = random.randint(min_s, max_s)
-            _log(task_id, f"😴 Sleeping {sleep_s}s before next account...")
-            # Sleep in 1s chunks so stop is responsive
-            for _ in range(sleep_s):
-                if _is_stopped(task_id):
-                    _log(task_id, "🛑 Stop requested during sleep")
-                    break
-                import time as _time
-                _time.sleep(1)
-
         ok_count = sum(1 for r in results if r["ok"])
-        _log(task_id, f"Loop ended: {ok_count}/{len(results)} registered over {i} iterations")
+        _log(task_id, f"Summary: {ok_count}/{len(results)} registered")
         _finish(task_id, results, "stopped" if _is_stopped(task_id) else "done")
-        return
-
-    # ── One-shot mode ──
-    count = 1 if fixed_email else req.count
-    for i in range(count):
-        if _is_stopped(task_id):
-            _log(task_id, "🛑 Stop requested")
-            break
-        r = _register_one(task_id, req, dm, cpa_mgmt, password, otp_token,
-                          client_id, redirect_uri, domains, proxy,
-                          fixed_email, fixed_domain, f"[{i+1}/{count}]")
-        results.append(r)
-
-    ok_count = sum(1 for r in results if r["ok"])
-    _log(task_id, f"Summary: {ok_count}/{len(results)} registered")
-    _finish(task_id, results, "stopped" if _is_stopped(task_id) else "done")
+    finally:
+        if debug_handler is not None:
+            for mod_name in ("core.chatgpt_session", "core.openai_auth", "core.otp"):
+                _logging.getLogger(mod_name).removeHandler(debug_handler)
 
 
 def _run_writeback(task_id: str, req: SingleEmailReq):

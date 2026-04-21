@@ -355,6 +355,8 @@ def get_chatgpt_session_at(
             logger.info("[chatgpt] %s - about_you step, submitting profile", email)
             from .openai_auth import CREATE_URL
             from .email_gen import random_display_name, random_birthdate
+            name = random_display_name()
+            bday = random_birthdate()
             about_hdrs = {
                 "Content-Type": "application/json",
                 "Accept": "application/json",
@@ -362,17 +364,23 @@ def get_chatgpt_session_at(
             }
             r = session.post(
                 CREATE_URL, headers=about_hdrs,
-                data=json.dumps({
-                    "name": random_display_name(),
-                    "birthdate": random_birthdate(),
-                }),
+                data=json.dumps({"name": name, "birthdate": bday}),
                 timeout=30,
             )
             ab_resp = _safe_json(r)
             new_page = (ab_resp.get("page") or {}).get("type", "")
             new_cont = ab_resp.get("continue_url", "")
             logger.info("[chatgpt] %s - about_you submit: HTTP %d, page=%s, continue=%s",
-                         email, r.status_code, new_page, new_cont[:120] if new_cont else "(none)")
+                         email, r.status_code, new_page, new_cont[:150] if new_cont else "(none)")
+            # If the response is not 200 or doesn't give a continue_url, dump
+            # the full body (+ cookies) so we can see what OpenAI actually
+            # returned (e.g. phone_required, error code, redirect hint).
+            if r.status_code != 200 or not new_cont:
+                logger.info("[chatgpt] %s - about_you body: %s",
+                             email, json.dumps(ab_resp)[:600])
+                cookies = [f"{c.name}@{c.domain}" for c in session.cookies.jar]
+                logger.info("[chatgpt] %s - cookies after about_you: %s",
+                             email, cookies)
             if r.status_code == 200:
                 continue_url = new_cont or continue_url
                 page_type = new_page
@@ -392,14 +400,25 @@ def get_chatgpt_session_at(
         # ── Step 9: Extract session cookie ──
         session_cookie = _extract_session_cookie(session)
         if not session_cookie:
-            logger.info("[chatgpt] %s - retrying chatgpt.com visit", email)
-            session.get(CHATGPT_BASE, timeout=30)
+            logger.info("[chatgpt] %s - no cookie yet, retrying chatgpt.com visit", email)
+            rr = session.get(CHATGPT_BASE, timeout=30)
+            logger.info("[chatgpt] %s - chatgpt.com retry landed: %s (HTTP %d)",
+                         email, rr.url[:150], rr.status_code)
             session_cookie = _extract_session_cookie(session)
 
         if not session_cookie:
             all_cookies = [(c.name, c.domain, c.value[:20] + "...")
                            for c in session.cookies.jar]
             logger.error("[chatgpt] %s - no session cookie. Cookies: %s", email, all_cookies)
+            # Diagnostic: what does /api/auth/session return without the cookie?
+            try:
+                rs = session.get(f"{CHATGPT_BASE}/api/auth/session",
+                                 headers={"accept": "application/json"},
+                                 timeout=15)
+                logger.info("[chatgpt] %s - no-cookie /api/auth/session: HTTP %d body=%s",
+                             email, rs.status_code, (rs.text or "")[:300])
+            except Exception as e:
+                logger.info("[chatgpt] %s - diagnostic session GET failed: %s", email, e)
             return {"ok": False, "error": "no_session_cookie_obtained"}
 
         logger.info("[chatgpt] %s - session cookie obtained (len=%d)", email, len(session_cookie))
