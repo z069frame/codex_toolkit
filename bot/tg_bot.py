@@ -198,7 +198,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _denied(update)
     text = ("🔧 Codex Toolkit Commands\n\n"
             "📝 /register [count] [domain] — Register accounts\n"
-            "🔁 /register_loop [min_s] [max_s] — Loop register\n"
+            "🔁 /register_loop [domain] [min_s] [max_s] — 5-min steady loop (default: aitech.email, 300-360s)\n"
             "🛑 /stop — Stop current loop task\n"
             "🔑 /session <email> — Get full session\n"
             "🔄 /writeback [email] [count] — DM Writeback\n"
@@ -238,14 +238,15 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_register_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Usage: /register_loop [domain] [min_sleep] [max_sleep]
+    Defaults: aitech.email + 300-360s sleep (~5 min = one ProxySeller rotation).
     Runs in background. Use /stop to halt.
     """
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
-    domain = None
-    min_s = 30
-    max_s = 180
+    domain = "aitech.email"  # only domain proven to pass OpenAI risk checks
+    min_s = 300
+    max_s = 360
     nums = []
     for a in args:
         if "." in a and not a.isdigit():
@@ -256,7 +257,7 @@ async def cmd_register_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         min_s, max_s = nums[0], nums[1]
     elif len(nums) == 1:
         min_s = nums[0]
-        max_s = max(min_s, 180)
+        max_s = max(min_s, 360)
 
     req = RegisterReq(count=1, loop=True, domain=domain,
                       min_sleep=min_s, max_sleep=max_s)

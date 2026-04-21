@@ -186,8 +186,11 @@ class RegisterReq(BaseModel):
     proxy: Optional[str] = None
     rt: bool = False
     loop: bool = False
-    min_sleep: int = 30     # seconds
-    max_sleep: int = 180    # seconds
+    # Defaults target "one account per ProxySeller sticky rotation (~5 min)"
+    # which gives each account a distinct residential IP without tripping
+    # OpenAI's "same IP, many accounts" signal.
+    min_sleep: int = 300    # seconds
+    max_sleep: int = 360    # seconds
     debug: bool = False     # pipe core.* INFO logs into task log
 
 

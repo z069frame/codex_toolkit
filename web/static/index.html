@@ -579,8 +579,8 @@
         <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
           <input type="checkbox" id="reg-loop"><label for="reg-loop" style="cursor:pointer">🔁 Loop mode</label>
         </div>
-        <div class="form-group"><label>Min sleep (s)</label><input type="number" id="reg-min" value="30" min="1"></div>
-        <div class="form-group"><label>Max sleep (s)</label><input type="number" id="reg-max" value="180" min="1"></div>
+        <div class="form-group"><label>Min sleep (s)</label><input type="number" id="reg-min" value="300" min="1"></div>
+        <div class="form-group"><label>Max sleep (s)</label><input type="number" id="reg-max" value="360" min="1"></div>
         <button class="btn btn-ghost btn-sm" onclick="stopRegister()" id="reg-stop-btn" style="display:none">🛑 Stop</button>
       </div>
     </div>
@@ -957,6 +957,7 @@ function populateDomainDropdown() {
   const sel = document.getElementById('reg-domain');
   const domains = _cfg.domains || [];
   const today = _cfg.today_domain || '';
+  const recommended = 'aitech.email';  // only domain that passes OpenAI risk checks
 
   // Clear existing options except the first "Auto" one
   while (sel.options.length > 1) sel.remove(1);
@@ -969,9 +970,12 @@ function populateDomainDropdown() {
   domains.forEach(d => {
     const opt = document.createElement('option');
     opt.value = d;
-    opt.textContent = d + (d === today ? ' (today)' : '');
+    opt.textContent = d + (d === today ? ' (today)' : '') + (d === recommended ? ' ✓' : '');
     sel.appendChild(opt);
   });
+
+  // Default to recommended domain if present, else Auto
+  if (domains.includes(recommended)) sel.value = recommended;
 }
 
 // ── Proxy ──
