@@ -183,40 +183,37 @@ def cmd_register(cfg, args):
         # on new accounts without phone verified. If we only obtained AT via the
         # ChatGPT NextAuth fallback (phone_required=True), OAuth will fail —
         # skip it and upload the session AT directly instead (no RT, expires ~7d).
+        # Preferred: CPA OAuth (gets refresh_token for auto-renewal).
+        # Fallback: direct upload of session AT (no RT, ~7d expiry).
         if at:
-            if phone_required:
-                print(f"  → Uploading session AT to CPA-Free (phone-blocked, skip OAuth)...")
-                up = cpa_mgmt.upload_codex_auth(
-                    email=email, access_token=at, account_id=account_id or "")
-                cpa_ok = up.get("ok", False)
-                if cpa_ok:
-                    # Set priority + websockets on the uploaded file
-                    cpa_mgmt.set_priority(up["name"], 100)
-                    cpa_mgmt.set_websockets(up["name"], True)
-                    print(f"  ✅ CPA upload: {up['name']} (priority=100, ws=on)")
-                else:
-                    print(f"  ⚠️  CPA upload failed: {up.get('error') or up.get('status')}")
-            else:
+            cpa_ok = False
+
+            # Try OAuth unless we already know phone will block
+            if not phone_required:
                 print(f"  → Starting CPA OAuth (free token)...")
                 oauth_result = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
                 cpa_ok = oauth_result.get("ok", False)
                 if cpa_ok:
-                    print(f"  ✅ CPA OAuth complete")
+                    print(f"  ✅ CPA OAuth complete (with refresh_token)")
                 else:
-                    # Fallback: if OAuth failed with phone-related issue, try upload
                     err = str(oauth_result.get("error", ""))
-                    if "no_code_extracted" in err or "add_phone" in err:
-                        print(f"  → CPA OAuth hit phone block; uploading session AT instead...")
-                        up = cpa_mgmt.upload_codex_auth(email=email, access_token=at)
-                        cpa_ok = up.get("ok", False)
-                        if cpa_ok:
-                            cpa_mgmt.set_priority(up["name"], 100)
-                            cpa_mgmt.set_websockets(up["name"], True)
-                            print(f"  ✅ CPA upload: {up['name']} (priority=100, ws=on)")
-                        else:
-                            print(f"  ⚠️  CPA upload failed: {up.get('error') or up.get('status')}")
-                    else:
-                        print(f"  ⚠️  CPA OAuth failed: {err} (will be retried by cron)")
+                    phone_related = any(x in err for x in (
+                        "no_code_extracted", "add_phone", "invalid_auth_step"))
+                    if not phone_related:
+                        print(f"  ⚠️  CPA OAuth failed (non-phone): {err}")
+
+            # Fallback: direct upload when OAuth failed or was skipped
+            if not cpa_ok:
+                reason = "phone-blocked" if phone_required else "OAuth failed"
+                print(f"  → Uploading session AT to CPA-Free (fallback, {reason})...")
+                up = cpa_mgmt.upload_codex_auth(email=email, access_token=at)
+                cpa_ok = up.get("ok", False)
+                if cpa_ok:
+                    cpa_mgmt.set_priority(up["name"], 100)
+                    cpa_mgmt.set_websockets(up["name"], True)
+                    print(f"  ✅ CPA upload: {up['name']} (priority=100, ws=on; no RT)")
+                else:
+                    print(f"  ⚠️  CPA upload failed: {up.get('error') or up.get('status')}")
 
         results.append({
             "email": email,
