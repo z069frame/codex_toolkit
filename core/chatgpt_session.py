@@ -347,6 +347,36 @@ def get_chatgpt_session_at(
                 except Exception as e:
                     logger.warning("[chatgpt] %s - workspace decode error: %s", email, e)
 
+        # ── Step 7b: About You (new-account profile submission) ──
+        # For freshly-registered accounts that skipped phone (via the
+        # ChatGPT NextAuth flow), OpenAI lands on /about-you asking for
+        # name + birthdate before it will issue the session cookie.
+        if page_type == "about_you":
+            logger.info("[chatgpt] %s - about_you step, submitting profile", email)
+            from .openai_auth import CREATE_URL
+            from .email_gen import random_display_name, random_birthdate
+            about_hdrs = {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Referer": f"{AUTH_BASE}/about-you",
+            }
+            r = session.post(
+                CREATE_URL, headers=about_hdrs,
+                data=json.dumps({
+                    "name": random_display_name(),
+                    "birthdate": random_birthdate(),
+                }),
+                timeout=30,
+            )
+            ab_resp = _safe_json(r)
+            new_page = (ab_resp.get("page") or {}).get("type", "")
+            new_cont = ab_resp.get("continue_url", "")
+            logger.info("[chatgpt] %s - about_you submit: HTTP %d, page=%s, continue=%s",
+                         email, r.status_code, new_page, new_cont[:120] if new_cont else "(none)")
+            if r.status_code == 200:
+                continue_url = new_cont or continue_url
+                page_type = new_page
+
         # ── Step 8: Follow continue_url (chatgpt.com callback) ──
         if continue_url and "chatgpt.com" in continue_url:
             logger.info("[chatgpt] %s - following ChatGPT callback URL", email)
