@@ -83,8 +83,20 @@ _runtime_proxy: str | None = None  # None = use config.json default
 
 
 def _load_saved_proxy():
-    """Load persisted proxy override on startup."""
+    """Load persisted proxy override on startup.
+
+    Priority: RUNTIME_PROXY env var (survives redeploys on Railway) >
+    on-disk .runtime_proxy file (per-instance override from Web UI).
+    """
     global _runtime_proxy
+    # 1) Env var (Railway-safe: set via `railway variables`)
+    env_val = os.environ.get("RUNTIME_PROXY", "").strip()
+    if env_val:
+        _runtime_proxy = env_val
+        logger.info("Loaded proxy from RUNTIME_PROXY env: %s",
+                    _mask_proxy(env_val))
+        return
+    # 2) On-disk file (set via PUT /api/proxy; wiped on Railway redeploy)
     try:
         if os.path.exists(_PROXY_FILE):
             with open(_PROXY_FILE) as f:
