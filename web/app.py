@@ -1010,14 +1010,16 @@ def _run_oauth(task_id: str, req: SingleEmailReq):
             results.append({"email": email, "ok": False, "error": f"callback: {cb_resp}"})
             continue
 
-        # Verify auth file and set priority
+        # Verify auth file + auto-config priority=100 + websockets=on
         auth = cpa_admin.find_auth_by_email(email)
         verified = False
         if auth:
             auth_id = auth.get("id")
             plan = auth.get("plan_type", "?")
-            _log(task_id, f"✅ {email}: verified auth_id={auth_id}, plan={plan}")
             cpa_admin.set_priority(auth_id, 100)
+            ws_ok = cpa_admin.set_websockets(auth_id, True)
+            _log(task_id, f"✅ {email}: auth_id={auth_id}, plan={plan}, priority=100, "
+                          f"websockets={'on' if ws_ok else 'set-failed'}")
             verified = True
         else:
             _log(task_id, f"⚠️ {email}: auth file not found in CPA (may take a moment)")
@@ -1031,17 +1033,15 @@ def _run_oauth(task_id: str, req: SingleEmailReq):
 
 
 def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
-    """
-    OAuth all workspaces of a single account into CPAB.
-    Uses one login session to iterate through every workspace the account belongs to.
-    """
+    """OAuth all workspaces of one account.
+    Thin wrapper around _oauth_multi_one (same helper used by subscribe-flow).
+    Ensures consistent priority + websockets auto-config on newly created auths."""
     cfg = CFG
     proxy = _get_proxy(req.proxy, "oauth-multi")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
-    cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
 
-    email = req.email.strip()
+    email = (req.email or "").strip()
     if not email:
         _log(task_id, "❌ email is required")
         _finish(task_id, {"ok": False, "error": "email_required"}, "error")
@@ -1051,126 +1051,34 @@ def _run_oauth_multi(task_id: str, req: OAuthMultiReq):
     if req.workspace_ids:
         _log(task_id, f"Filter: {len(req.workspace_ids)} workspace(s) {req.workspace_ids}")
 
-    # start_oauth_fn returns a fresh CPAB OAuth URL+state per iteration
-    def _start():
-        return cpa_admin.start_oauth()
+    cpa_admin = CPAMgmt(cfg["cpa_plus_base"], cfg["cpa_plus_bearer"])
+    dm = DataManager(cfg["dm_base"], cfg["dm_token"]) if req.writeback else None
 
-    multi = oauth_login_multi(
-        start_oauth_fn=_start,
+    om = _oauth_multi_one(
+        cpa_admin=cpa_admin,
         email=email,
         password=password,
         otp_token=otp_token,
         proxy=proxy,
         workspace_filter=req.workspace_ids,
+        writeback=req.writeback,
+        dm=dm,
         log_fn=lambda m: _log(task_id, m),
     )
 
-    if not multi.get("ok") and not multi.get("results"):
-        _log(task_id, f"❌ fatal: {multi.get('error')}")
-        _finish(task_id, multi, "error")
+    if not om.get("ok") and not om.get("results"):
+        _log(task_id, f"❌ fatal: {om.get('error')}")
+        _finish(task_id, om, "error")
         return
 
-    workspaces = multi.get("workspaces", [])
-    results = multi.get("results", [])
-
-    _log(task_id, f"Login ok, {len(workspaces)} workspaces, {len(results)} OAuth attempts")
-
-    # Process each successful code: send to CPAB callback + verify + set priority
-    final_results = []
-    for r in results:
-        ws_id = r.get("workspace_id", "?")
-        ws_name = r.get("workspace_name", "?")
-        ws_kind = r.get("workspace_kind", "?")
-        tag = f"{ws_name} ({ws_kind})"
-
-        if not r.get("ok") or not r.get("code"):
-            _log(task_id, f"  ⏭️ {tag}: skipped — {r.get('error', 'no code')}")
-            final_results.append({
-                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
-                "ok": False, "error": r.get("error", "no_code"),
-            })
-            continue
-
-        code = r["code"]
-        state = r.get("state", "")
-        cb_resp = cpa_admin.oauth_callback(state, code)
-        if not cb_resp.get("ok"):
-            _log(task_id, f"  ❌ {tag}: callback failed: {cb_resp}")
-            final_results.append({
-                "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
-                "ok": False, "error": f"callback: {cb_resp}",
-            })
-            continue
-
-        _log(task_id, f"  ✅ {tag}: callback ok")
-
-        # Verify CPAB auth and set priority
-        auth = cpa_admin.find_auth_by_email(email)
-        dm_written = False
-        if auth:
-            auth_id = auth.get("id")
-            cpa_admin.set_priority(auth_id, 100)
-            _log(task_id, f"     auth_id={auth_id} priority set")
-
-        # DM writeback (only if --writeback requested)
-        if req.writeback and auth:
-            # CPA-management schema: list returns flat entries with
-            # id_token (parsed JWT claims, incl. chatgpt_account_id) but
-            # NOT access_token. Match by workspace id on id_token, then
-            # download the matching file to extract the raw AT.
-            cpab_at = None
-            fresh_files = cpa_admin.list_auth_files()
-            for ff in fresh_files:
-                if (ff.get("email") or ff.get("account") or "").lower() != email.lower():
-                    continue
-                if (ff.get("provider") or ff.get("type") or "").lower() != "codex":
-                    continue
-                id_token = ff.get("id_token") or {}
-                if isinstance(id_token, str):
-                    id_token = {}
-                ff_aid = id_token.get("chatgpt_account_id", "")
-                if ff_aid == ws_id:
-                    raw = cpa_admin.download_auth_file(ff.get("name") or ff.get("id", ""))
-                    if raw:
-                        ff_at = raw.get("access_token", "")
-                        if ff_at and len(ff_at) > 100:
-                            cpab_at = ff_at
-                    break
-
-            if cpab_at:
-                claims = decode_jwt_claims(cpab_at)
-                auth_info = claims.get("https://api.openai.com/auth", {})
-                plan_type = auth_info.get("chatgpt_plan_type", "")
-                account_id = auth_info.get("chatgpt_account_id", "")
-                new_tc = "team" if plan_type in ("team", "enterprise", "business") else "free"
-
-                dm = DataManager(cfg["dm_base"], cfg["dm_token"])
-                dm_acc = dm.find_account(email)
-                if dm_acc:
-                    patch_body = {"access_token": cpab_at, "token_context": new_tc}
-                    if account_id:
-                        patch_body["team_account_id"] = account_id
-                    pr = dm.patch_account(dm_acc["id"], patch_body)
-                    dm_written = pr.get("ok", False)
-                    if dm_written:
-                        _log(task_id, f"     DM writeback: tc={new_tc}, plan={plan_type}, ws={account_id}")
-                    else:
-                        _log(task_id, f"     ⚠️ DM writeback failed")
-            else:
-                _log(task_id, f"     ⚠️ CPAB AT for workspace {ws_id} not found")
-
-        final_results.append({
-            "workspace_id": ws_id, "workspace_name": ws_name, "workspace_kind": ws_kind,
-            "ok": True, "dm_written": dm_written,
-        })
-
-    ok_count = sum(1 for r in final_results if r["ok"])
-    _log(task_id, f"Summary: {ok_count}/{len(final_results)} workspaces OAuth'd")
+    results = om.get("results", [])
+    ok_count = sum(1 for r in results if r.get("ok"))
+    _log(task_id, f"Summary: {ok_count}/{len(results)} workspaces OAuth'd")
     _finish(task_id, {
         "ok": True,
         "email": email,
-        "workspaces": workspaces,
-        "results": final_results,
+        "workspaces": om.get("workspaces", []),
+        "results": results,
     })
 
 
