@@ -187,6 +187,37 @@ def _get_proxy(req_proxy: str | None = None, command: str | None = None) -> str 
 _load_saved_proxy()
 
 
+@app.on_event("startup")
+async def _auto_start_tasks():
+    """Auto-start background tasks from env vars after server boot.
+
+    Set on Railway via:
+      railway variables --set AUTO_REGISTER_LOOP=1
+      railway variables --set AUTO_REGISTER_DOMAIN=aitech.email    # optional
+      railway variables --set AUTO_REGISTER_MIN_SLEEP=300          # optional
+      railway variables --set AUTO_REGISTER_MAX_SLEEP=360          # optional
+
+    Useful because Railway redeploys reset in-memory task state — without
+    auto-start every redeploy silently stops the register loop.
+    """
+    flag = os.environ.get("AUTO_REGISTER_LOOP", "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    try:
+        domain = os.environ.get("AUTO_REGISTER_DOMAIN", "aitech.email").strip() or None
+        min_s = int(os.environ.get("AUTO_REGISTER_MIN_SLEEP", "300"))
+        max_s = int(os.environ.get("AUTO_REGISTER_MAX_SLEEP", "360"))
+        req = RegisterReq(loop=True, domain=domain,
+                          min_sleep=min_s, max_sleep=max_s)
+        task_id = _create_task("register", req.model_dump())
+        threading.Thread(target=_run_register, args=(task_id, req),
+                         daemon=True).start()
+        logger.info("[auto-start] register loop started task=%s "
+                    "domain=%s sleep=%d-%ds", task_id, domain, min_s, max_s)
+    except Exception as e:
+        logger.exception("[auto-start] register loop failed to start: %s", e)
+
+
 def _probe_egress_ip(proxy: str | None, timeout: int = 10) -> str:
     """Get the outbound IP seen by the internet through `proxy`.
 
