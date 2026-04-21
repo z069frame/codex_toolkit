@@ -213,7 +213,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👁 /watch on [min] | off — Deact watchdog\n"
             "🔎 /check <email> — Check account\n"
             "📊 /accounts [query] — Search accounts\n"
-            "💳 /pay [email] [country] [seats] — Payment link\n"
+            "💳 /pay [email] [country] [count] [plan=team|plus] [mode=new|old] — Payment link\n"
             "✅ /mark_paid <email|link> [cat] — Mark subscribed\n"
             "📋 /tasks — Recent tasks\n"
             "🌐 /proxy [url] — View/set proxy")
@@ -829,25 +829,41 @@ def _pick_valid_accounts(dm: DataManager, count: int) -> tuple[list, int]:
 
 async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate payment link(s).
-    /pay [country] [count]              — auto-pick N accounts
-    /pay email@x.com [country]          — specific account
-    /pay DE 3                           — 3 accounts, Germany
+    /pay [country] [count] [plan] [mode]   — auto-pick N accounts
+    /pay email@x.com [country] ...         — specific account
+    plan: team (default) | plus
+    mode: new (default, embedded) | old (redirect, standalone URL)
+    Examples:
+      /pay DE 3              — 3 team accounts, Germany
+      /pay plus US           — 1 plus account, US
+      /pay old               — 1 team account, old redirect URL
+      /pay plus old SG       — 1 plus account, old URL, Singapore
     """
     if not _auth_check(update):
         return await _denied(update)
     args = context.args or []
 
     _COUNTRIES = {"US", "DE", "GB", "JP", "FR", "IT", "ES", "NL", "CA", "AU", "SG", "HK", "KR", "BR"}
+    _PLANS = {"team", "plus"}
+    _MODES = {"new": "custom", "old": "redirect", "custom": "custom", "redirect": "redirect"}
     emails = []
     country = "US"
     count = 1
+    plan = "team"
+    ui_mode = "custom"
     for a in args:
-        if a.upper() in _COUNTRIES:
-            country = a.upper()
+        u = a.upper()
+        la = a.lower()
+        if u in _COUNTRIES:
+            country = u
         elif "@" in a:
             emails.append(a)
         elif a.isdigit():
             count = int(a)
+        elif la in _PLANS:
+            plan = la
+        elif la in _MODES:
+            ui_mode = _MODES[la]
 
     currency = {"US": "USD", "DE": "EUR", "GB": "GBP", "JP": "JPY",
                 "FR": "EUR", "IT": "EUR", "ES": "EUR", "NL": "EUR",
@@ -878,8 +894,10 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ No accounts with valid AT.\nRun /relogin first.")
         accounts_to_process = valid
 
+    mode_label = "old/redirect" if ui_mode == "redirect" else "new/custom"
     await update.message.reply_text(
-        f"💳 Generating {len(accounts_to_process)} link(s) — {country} ({currency})")
+        f"💳 Generating {len(accounts_to_process)} link(s) — "
+        f"plan={plan}, mode={mode_label}, {country} ({currency})")
 
     results = []
     for acc in accounts_to_process:
@@ -888,17 +906,20 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         acc_id = acc.get("id")
 
         r = generate_payment_link(
-            access_token=at, country=country,
-            currency=currency, seat_quantity=seats, proxy=proxy)
+            access_token=at, plan=plan, ui_mode=ui_mode,
+            country=country, currency=currency,
+            seat_quantity=seats, proxy=proxy)
 
         if r.get("ok"):
             link = r["payment_link"]
-            if acc_id:
+            # Only persist for team plan (plus is personal, no workspace/seats)
+            if acc_id and plan == "team":
                 dm.patch_account(acc_id, {
                     "payment_link": link,
                     "subscription_status": "pending_payment",
                 })
-            results.append(f"✅ {email}\n🔗 {link}")
+            tag = f"[{plan}/{mode_label}]"
+            results.append(f"✅ {email} {tag}\n🔗 {link}")
         else:
             results.append(f"❌ {email}: {r.get('error', '?')[:80]}")
 

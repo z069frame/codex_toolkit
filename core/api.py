@@ -807,6 +807,8 @@ class DataManager:
 
 def generate_payment_link(
     access_token: str,
+    plan: str = "team",
+    ui_mode: str = "custom",
     country: str = "US",
     currency: str = "USD",
     seat_quantity: int = 5,
@@ -815,19 +817,26 @@ def generate_payment_link(
     proxy: str | None = None,
 ) -> dict:
     """
-    Generate a ChatGPT Team checkout payment link via POST /backend-api/payments/checkout.
+    Generate a ChatGPT checkout payment link via POST /backend-api/payments/checkout.
 
     Args:
         access_token: Valid free-tier ChatGPT access token
+        plan: "team" (chatgptteamplan) or "plus" (chatgptplusplan)
+        ui_mode: "custom" (new embedded Stripe iframe — requires the browser
+                 to be logged into ChatGPT so the checkout page has cookies)
+                 or "redirect" (old mode — OpenAI returns a direct Stripe URL
+                 that works without login cookies). Use "redirect" when you
+                 want to hand a link to a user whose browser may not be
+                 signed in.
         country: Billing country code (US, DE, etc.)
         currency: Currency (USD, EUR, etc.)
-        seat_quantity: Number of seats (min 2, default 9)
-        workspace_name: Team workspace name (auto-generated if None)
-        price_interval: "month" or "year"
+        seat_quantity: Number of team seats (min 2) — team only, ignored for plus
+        price_interval: "month" or "year" — team only, ignored for plus
+        workspace_name: Team workspace name (auto-generated if None) — team only
         proxy: Optional HTTP/SOCKS proxy
 
     Returns:
-        {ok, payment_link, checkout_session_id, processor, error}
+        {ok, payment_link, checkout_session_id, processor, workspace_name, plan, ui_mode, error}
     """
     try:
         from curl_cffi import requests as cffi_requests
@@ -837,36 +846,59 @@ def generate_payment_link(
     if not access_token or len(access_token) < 100:
         return {"ok": False, "error": "invalid_access_token"}
 
-    # Derive workspace name from token email if not provided
-    if not workspace_name:
-        claims = decode_jwt_claims(access_token)
-        profile = claims.get("https://api.openai.com/profile", {})
-        email = profile.get("email", "")
-        prefix = email.split("@")[0] if email else "team"
-        import re as _re
-        prefix = _re.sub(r"[^a-zA-Z0-9]", "-", prefix)[:24]
-        import datetime as _dt
-        date_tag = _dt.datetime.utcnow().strftime("%Y%m%d")
-        workspace_name = f"team-{prefix}-{date_tag}"
+    plan = (plan or "team").lower()
+    ui_mode = (ui_mode or "custom").lower()
+    if plan not in ("team", "plus"):
+        return {"ok": False, "error": f"unknown_plan: {plan}"}
+    if ui_mode not in ("custom", "redirect"):
+        return {"ok": False, "error": f"unknown_ui_mode: {ui_mode}"}
 
-    payload = {
-        "plan_name": "chatgptteamplan",
-        "team_plan_data": {
-            "workspace_name": workspace_name,
-            "price_interval": price_interval,
-            "seat_quantity": max(2, seat_quantity),
-        },
-        "billing_details": {
-            "country": country,
-            "currency": currency,
-        },
-        "cancel_url": "https://chatgpt.com/#pricing",
-        "promo_campaign": {
-            "promo_campaign_id": "team-1-month-free",
-            "is_coupon_from_query_param": False,
-        },
-        "checkout_ui_mode": "custom",
-    }
+    if plan == "team":
+        # Derive workspace name from token email if not provided
+        if not workspace_name:
+            claims = decode_jwt_claims(access_token)
+            profile = claims.get("https://api.openai.com/profile", {})
+            email = profile.get("email", "")
+            prefix = email.split("@")[0] if email else "team"
+            import re as _re
+            prefix = _re.sub(r"[^a-zA-Z0-9]", "-", prefix)[:24]
+            import datetime as _dt
+            date_tag = _dt.datetime.utcnow().strftime("%Y%m%d")
+            workspace_name = f"team-{prefix}-{date_tag}"
+
+        payload = {
+            "plan_name": "chatgptteamplan",
+            "team_plan_data": {
+                "workspace_name": workspace_name,
+                "price_interval": price_interval,
+                "seat_quantity": max(2, seat_quantity),
+            },
+            "billing_details": {
+                "country": country,
+                "currency": currency,
+            },
+            "cancel_url": "https://chatgpt.com/#pricing",
+            "promo_campaign": {
+                "promo_campaign_id": "team-1-month-free",
+                "is_coupon_from_query_param": False,
+            },
+            "checkout_ui_mode": ui_mode,
+        }
+    else:  # plus
+        workspace_name = None
+        payload = {
+            "plan_name": "chatgptplusplan",
+            "entry_point": "all_plans_pricing_modal",
+            "billing_details": {
+                "country": country,
+                "currency": currency,
+            },
+            "promo_campaign": {
+                "promo_campaign_id": "plus-1-month-free",
+                "is_coupon_from_query_param": False,
+            },
+            "checkout_ui_mode": ui_mode,
+        }
 
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -918,6 +950,8 @@ def generate_payment_link(
         "checkout_session_id": session_id,
         "processor": processor,
         "workspace_name": workspace_name,
+        "plan": plan,
+        "ui_mode": ui_mode,
     }
 
 

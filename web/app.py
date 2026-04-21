@@ -277,6 +277,9 @@ class PayReq(BaseModel):
     country: str = "US"
     count: int = 1
     proxy: Optional[str] = None
+    plan: str = "team"          # "team" | "plus"
+    ui_mode: str = "custom"     # "custom" (new) | "redirect" (old)
+    seat_quantity: int = 5      # team only
 
 
 class MarkPaidReq(BaseModel):
@@ -1917,15 +1920,18 @@ async def api_pay(req: PayReq):
     results = []
     for acc in accounts:
         r = _gen_pay(access_token=acc.get("access_token", ""),
+                     plan=req.plan, ui_mode=req.ui_mode,
                      country=req.country.upper(), currency=currency,
-                     seat_quantity=5, proxy=proxy)
+                     seat_quantity=req.seat_quantity, proxy=proxy)
         email = acc.get("email", "?")
         if r.get("ok"):
-            if acc.get("id"):
+            # Only persist the link for team plan (plus is one-off, no seats).
+            if acc.get("id") and req.plan == "team":
                 dm.patch_account(acc["id"], {"payment_link": r["payment_link"],
                                              "subscription_status": "pending_payment"})
             results.append({"email": email, "ok": True, "link": r["payment_link"],
-                           "workspace": r.get("workspace_name")})
+                           "workspace": r.get("workspace_name"),
+                           "plan": r.get("plan"), "ui_mode": r.get("ui_mode")})
         else:
             results.append({"email": email, "ok": False, "error": r.get("error")})
     return {"results": results}
