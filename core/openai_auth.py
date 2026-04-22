@@ -342,16 +342,33 @@ def register_account(
         if is_existing:
             logger.info("[register] %s - account already exists, OTP auto-sent", email)
         else:
-            # 5) Set password
-            # NOTE: do NOT attach openai-sentinel-token on /user/register.
-            # Session cookies from the previous sentinel-verified call carry
-            # the anti-bot check forward; re-sending the header here triggers
-            # 400 (reference impl matches this).
+            # 4.5) Pre-load the create-account/password HTML page.
+            # Reference impl (lxf746/any-auto-register) does this before
+            # POST /user/register; the GET sets a "page-stage" cookie the
+            # server expects on the subsequent API calls. Without it,
+            # OpenAI's state machine later rejects /create_account with
+            # invalid_auth_step.
+            logger.info("[register] %s - loading /create-account/password page", email)
+            try:
+                session.get(
+                    f"{AUTH_BASE}/create-account/password",
+                    headers={
+                        "Referer": "https://chatgpt.com/",
+                        "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                                   "q=0.9,*/*;q=0.8"),
+                    },
+                    timeout=20,
+                )
+            except Exception as e:
+                logger.info("[register] %s - page-load warn: %s", email, e)
+
+            # 5) Set password (POST /api/accounts/user/register)
             logger.info("[register] %s - setting password", email)
             pwd_hdrs = {
                 "Referer": f"{AUTH_BASE}/create-account/password",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "Origin": AUTH_BASE,
             }
             r = session.post(REGISTER_URL, headers=pwd_hdrs,
                              data=json.dumps({"password": password, "username": email}),
@@ -360,13 +377,12 @@ def register_account(
             if r.status_code != 200:
                 return {"ok": False, "error": f"register_{r.status_code}: {r.text[:300]}"}
 
-            # 6) Send OTP
+            # 6) Send OTP — reference impl uses GET, not POST
             logger.info("[register] %s - sending OTP", email)
-            r = session.post(SEND_OTP_URL,
-                             headers={"Referer": f"{AUTH_BASE}/create-account/password",
-                                      "Content-Type": "application/json",
-                                      "Accept": "application/json"},
-                             timeout=30)
+            r = session.get(SEND_OTP_URL,
+                            headers={"Referer": f"{AUTH_BASE}/create-account/password",
+                                     "Accept": "application/json"},
+                            timeout=30)
             if r.status_code != 200:
                 return {"ok": False,
                         "error": f"send_otp_{r.status_code}: {r.text[:300]}"}
@@ -380,7 +396,14 @@ def register_account(
         used_codes.add(otp_code)
 
         logger.info("[register] %s - validating OTP: %s", email, otp_code)
-        r = session.post(VERIFY_OTP_URL, headers=hdrs,
+        # Referer must be /email-verification to align server state with the
+        # user-visible page progression — ref impl uses this exact value.
+        otp_hdrs = {
+            "Referer": f"{AUTH_BASE}/email-verification",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        r = session.post(VERIFY_OTP_URL, headers=otp_hdrs,
                          data=json.dumps({"code": otp_code}), timeout=30)
         if r.status_code != 200:
             return {"ok": False, "error": f"otp_validate_{r.status_code}"}
