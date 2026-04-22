@@ -294,6 +294,12 @@ class ProbeClientReq(BaseModel):
     client_id: str
     redirect_uri: str = "http://localhost:1455/auth/callback"
     proxy: Optional[str] = None
+    # Minimal mode: omit Codex-specific flags (codex_cli_simplified_flow,
+    # id_token_add_organizations, prompt=login) so non-Codex clients don't
+    # bail with AuthApiFailure. Default off (uses Codex-style URL).
+    minimal: bool = False
+    # Additional custom scope (space-separated) when using minimal
+    scope: Optional[str] = None
 
 
 class OAuthFreeReq(BaseModel):
@@ -2121,12 +2127,25 @@ async def api_probe_client(req: ProbeClientReq):
     what OpenAI Hydra responds with. Tells us if this is a valid client,
     what flow it expects (password / SSO / device code / custom), and
     whether the redirect_uri matches the app registration."""
-    from core.openai_auth import _build_oauth_url, _gen_pkce, _gen_state, _create_session
+    from urllib.parse import urlencode as _urlencode
+    from core.openai_auth import (_build_oauth_url, _gen_pkce, _gen_state,
+                                    _create_session, AUTH_URL, DEFAULT_SCOPE)
 
     cv, cc = _gen_pkce()
     state = _gen_state()
     try:
-        auth_url = _build_oauth_url(req.client_id, req.redirect_uri, cc, state)
+        if req.minimal:
+            auth_url = AUTH_URL + "?" + _urlencode({
+                "client_id": req.client_id,
+                "response_type": "code",
+                "redirect_uri": req.redirect_uri,
+                "scope": req.scope or DEFAULT_SCOPE,
+                "state": state,
+                "code_challenge": cc,
+                "code_challenge_method": "S256",
+            })
+        else:
+            auth_url = _build_oauth_url(req.client_id, req.redirect_uri, cc, state)
     except Exception as e:
         raise HTTPException(500, f"build_url: {e}")
 
