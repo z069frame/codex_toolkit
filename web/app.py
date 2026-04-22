@@ -271,6 +271,17 @@ class SingleEmailReq(BaseModel):
     proxy: Optional[str] = None
 
 
+class TestAtReq(BaseModel):
+    """Test whether an AT works against ChatGPT Codex backend-api."""
+    email: Optional[str] = None          # if set, pull AT from DM/CPA
+    access_token: Optional[str] = None   # or pass AT directly
+    source: str = "cpa"                  # "cpa" | "dm" — where to fetch AT when only email given
+    cpa_file_name: Optional[str] = None  # override: specific CPA auth-file name
+    prompt: str = "say hi in 3 words"
+    model: str = "gpt-5"
+    proxy: Optional[str] = None
+
+
 class OAuthFreeReq(BaseModel):
     email: Optional[str] = None
     count: int = 0
@@ -1990,6 +2001,115 @@ async def api_subscribe_flow(req: SubscribeFlowReq):
     task_id = _create_task("subscribe-flow", req.model_dump())
     threading.Thread(target=_run_subscribe_flow, args=(task_id, req), daemon=True).start()
     return {"task_id": task_id}
+
+
+@app.post("/api/test-at")
+async def api_test_at(req: TestAtReq):
+    """Quick smoke test: take an AT (or pull by email) and hit the ChatGPT
+    Codex backend-api from the Railway server through the configured proxy.
+    Useful for diagnosing 'CPA requests all failing' issues — runs the same
+    call CPA's proxy would make."""
+    import urllib.parse
+    import urllib.request
+    import urllib.error
+
+    at = (req.access_token or "").strip()
+    account_id = ""
+    source_info = ""
+
+    # Resolve AT from email if not provided directly
+    if not at and req.email:
+        if req.source == "dm":
+            dm = DataManager(CFG["dm_base"], CFG["dm_token"])
+            acc = dm.find_account(req.email)
+            if not acc:
+                raise HTTPException(404, f"{req.email} not found in DM")
+            at = acc.get("access_token", "")
+            source_info = f"dm:{req.email}"
+        else:  # cpa
+            # Pull from CPA auth file (defaults to -free.json variant)
+            name = req.cpa_file_name or f"codex-{req.email}-free.json"
+            url = (f"{CFG['cpa_mgmt_base']}/v0/management/auth-files/download"
+                   f"?name={urllib.parse.quote(name)}")
+            try:
+                r = urllib.request.Request(url, method="GET",
+                    headers={"Authorization": f"Bearer {CFG['cpa_mgmt_bearer']}"})
+                with urllib.request.urlopen(r, timeout=15) as rr:
+                    content = json.load(rr)
+                at = content.get("access_token", "")
+                account_id = content.get("account_id", "") or ""
+                source_info = f"cpa:{name}"
+            except urllib.error.HTTPError as e:
+                raise HTTPException(404, f"CPA fetch failed: HTTP {e.code}")
+
+    if not at or len(at) < 100:
+        raise HTTPException(400, "no valid access_token found")
+
+    # Decode account_id from AT claims if still unknown
+    if not account_id:
+        claims = decode_jwt_claims(at) or {}
+        auth = claims.get("https://api.openai.com/auth", {}) or {}
+        account_id = auth.get("chatgpt_account_id", "") or ""
+
+    proxy = _get_proxy(req.proxy, "test-at")
+
+    # Probe egress IP first so we know the route
+    egress = _probe_egress_ip(proxy, timeout=8)
+
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        raise HTTPException(500, "curl_cffi not available")
+
+    s = cffi_requests.Session(impersonate="chrome136")
+    if proxy:
+        s.proxies = {"https": proxy, "http": proxy}
+
+    results: dict[str, Any] = {
+        "source": source_info or "direct_token",
+        "at_len": len(at),
+        "account_id": account_id,
+        "egress_ip": egress,
+    }
+
+    # Test A: /backend-api/accounts/check (cheap, no quota burn)
+    try:
+        r = s.get("https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+                  headers={"Authorization": f"Bearer {at}",
+                           "Accept": "*/*",
+                           "ChatGPT-Account-ID": account_id},
+                  timeout=30)
+        results["accounts_check"] = {
+            "http": r.status_code,
+            "body_snippet": (r.text or "")[:600],
+        }
+    except Exception as e:
+        results["accounts_check"] = {"error": str(e)[:200]}
+
+    # Test B: actual Codex completion request
+    try:
+        r = s.post("https://chatgpt.com/backend-api/codex/responses",
+                   headers={"Authorization": f"Bearer {at}",
+                            "Content-Type": "application/json",
+                            "Accept": "text/event-stream",
+                            "ChatGPT-Account-ID": account_id,
+                            "OpenAI-Beta": "responses=experimental"},
+                   json={
+                       "model": req.model,
+                       "input": [{"type": "message", "role": "user",
+                                  "content": [{"type": "input_text",
+                                               "text": req.prompt}]}],
+                       "stream": False,
+                   },
+                   timeout=60)
+        results["codex_responses"] = {
+            "http": r.status_code,
+            "body_snippet": (r.text or "")[:1000],
+        }
+    except Exception as e:
+        results["codex_responses"] = {"error": str(e)[:200]}
+
+    return results
 
 
 @app.post("/api/invite")
