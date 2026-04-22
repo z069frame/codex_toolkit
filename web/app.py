@@ -263,6 +263,11 @@ class RegisterReq(BaseModel):
     min_sleep: int = 300    # seconds
     max_sleep: int = 360    # seconds
     debug: bool = False     # pipe core.* INFO logs into task log
+    # Override the OAuth client_id (defaults to config's oauth_client_id = Codex).
+    # Useful for experimenting with alternative OpenAI apps (e.g. ones where
+    # the phone gate is optional).
+    client_id: Optional[str] = None
+    redirect_uri: Optional[str] = None
 
 
 class SingleEmailReq(BaseModel):
@@ -929,9 +934,11 @@ def _run_register(task_id: str, req: RegisterReq):
     proxy = _get_proxy(req.proxy, "register")
     password = cfg["reg_password"]
     otp_token = cfg["otp_token"]
-    client_id = cfg["oauth_client_id"]
-    redirect_uri = cfg["oauth_redirect_uri"]
+    client_id = (req.client_id or "").strip() or cfg["oauth_client_id"]
+    redirect_uri = (req.redirect_uri or "").strip() or cfg["oauth_redirect_uri"]
     domains = cfg["domains"]
+    if req.client_id:
+        logger.info("[register] client_id override: %s", client_id)
 
     dm = DataManager(cfg["dm_base"], cfg["dm_token"])
     cpa_mgmt = CPAMgmt(cfg["cpa_mgmt_base"], cfg["cpa_mgmt_bearer"])
