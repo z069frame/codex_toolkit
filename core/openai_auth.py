@@ -456,6 +456,14 @@ def register_account(
                          data=json.dumps({"code": otp_code}), timeout=30)
         if r.status_code != 200:
             return {"ok": False, "error": f"otp_validate_{r.status_code}"}
+        # Log the validate response — shows if server already hints at next
+        # step (add_phone vs continue_url vs page.type).
+        try:
+            otp_resp_body = r.text[:400]
+            logger.info("[register] %s - otp_validate response: %s",
+                        email, otp_resp_body)
+        except Exception:
+            pass
 
         # 8) Create user account — POST name/birthdate with Referer=/about-you.
         # Do NOT check page_type first: OpenAI's state machine seems to gate
