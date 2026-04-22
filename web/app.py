@@ -711,6 +711,68 @@ def _invite_via_at(access_token: str, target_emails: list, role: str,
 #  Shared helpers (reused from main.py logic)
 # ---------------------------------------------------------------------------
 
+def _try_codex_login(email: str, password: str, otp_token: str,
+                      client_id: str, redirect_uri: str,
+                      proxy: str | None) -> dict:
+    """Run a fresh Codex-client PKCE OAuth *login* for an existing account.
+
+    Used after the NextAuth session fallback has already succeeded — the
+    account exists + has a profile, so login shouldn't retrigger phone
+    signup gate. If successful, yields a proper Codex-client AT+RT+id_token
+    that passes /backend-api/codex/* authentication.
+
+    Returns {ok, access_token, refresh_token, id_token, error}.
+    """
+    from urllib.parse import urlencode
+    from curl_cffi import requests as cffi_requests
+    from core.openai_auth import (
+        _gen_pkce, _gen_state, _build_oauth_url,
+        oauth_login, TOKEN_URL,
+    )
+
+    code_verifier, code_challenge = _gen_pkce()
+    state = _gen_state()
+    auth_url = _build_oauth_url(client_id, redirect_uri,
+                                 code_challenge, state)
+    code, _state, err = oauth_login(auth_url, email, password, otp_token, proxy)
+    if not code:
+        return {"ok": False, "error": f"oauth_login: {err}"}
+
+    # Exchange code for tokens
+    try:
+        r = cffi_requests.post(
+            TOKEN_URL,
+            data=urlencode({
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+            }),
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "Accept": "application/json"},
+            impersonate="chrome136",
+            proxies={"https": proxy, "http": proxy} if proxy else None,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"token_exchange_err: {e}"}
+
+    if r.status_code != 200:
+        return {"ok": False,
+                "error": f"token_exchange_{r.status_code}: {(r.text or '')[:200]}"}
+    try:
+        d = r.json()
+    except Exception:
+        return {"ok": False, "error": "token_exchange_invalid_json"}
+    return {
+        "ok": bool(d.get("access_token")),
+        "access_token": d.get("access_token", ""),
+        "refresh_token": d.get("refresh_token", ""),
+        "id_token": d.get("id_token", ""),
+    }
+
+
 def _do_cpa_mgmt_oauth(cpa_mgmt: CPAMgmt, email: str, password: str,
                         otp_token: str, proxy: str | None) -> dict:
     url_resp = cpa_mgmt.get_oauth_url()
@@ -764,15 +826,24 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
         sess = get_chatgpt_session_at(email, password, otp_token, proxy)
         if sess["ok"]:
             at = sess["access_token"]
-            codex_at = sess.get("codex_access_token", "") or ""
-            codex_rt = sess.get("codex_refresh_token", "") or ""
-            codex_id_token = sess.get("codex_id_token", "") or ""
-            if codex_at:
-                _log(task_id, f"✅ {email}: session AT + piggyback Codex AT obtained "
-                              f"(session_at={len(at)}, codex_at={len(codex_at)}, codex_rt={len(codex_rt)})")
-            else:
-                _log(task_id, f"✅ {email}: session AT obtained (len={len(at)}); "
-                              f"⚠️ piggyback Codex PKCE failed — account won't work for Codex API")
+            _log(task_id, f"✅ {email}: session AT obtained (len={len(at)})")
+            # Now that the account exists (created via NextAuth about_you),
+            # try a fresh Codex PKCE login. If the server gates phone by
+            # signup only (not login), we get a Codex-client AT.
+            try:
+                ct = _try_codex_login(email, password, otp_token,
+                                       client_id, redirect_uri, proxy)
+                if ct.get("ok"):
+                    codex_at = ct.get("access_token", "")
+                    codex_rt = ct.get("refresh_token", "")
+                    codex_id_token = ct.get("id_token", "")
+                    _log(task_id, f"✅ {email}: Codex login ok — Codex AT "
+                                  f"(len={len(codex_at)}, RT={len(codex_rt)})")
+                else:
+                    _log(task_id, f"⚠️ {email}: Codex login failed: "
+                                  f"{ct.get('error','?')[:100]}")
+            except Exception as e:
+                _log(task_id, f"⚠️ {email}: Codex login exception: {e}")
         else:
             _log(task_id, f"⚠️ {email}: session failed: {sess['error']}")
     else:

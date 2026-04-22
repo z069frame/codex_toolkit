@@ -603,6 +603,49 @@ def oauth_login(
             if not otp_validated:
                 return None, None, "otp_validate_failed"
 
+        # Diagnostic: what page does the server send us to post-OTP?
+        try:
+            post_otp_resp = _safe_json(r)
+            post_otp_page = (post_otp_resp.get("page") or {}).get("type", "")
+            post_otp_cont = post_otp_resp.get("continue_url", "")
+            logger.info("[oauth] %s - post-OTP page=%s continue=%s",
+                        email, post_otp_page, post_otp_cont[:150])
+        except Exception:
+            post_otp_page = ""
+            post_otp_resp = {}
+            post_otp_cont = ""
+
+        # For existing accounts logging into Codex client, if the server
+        # lands us on add_phone (strict policy), POST about_you anyway.
+        # If it does accept it (server doesn't gate by client_id but by
+        # account state), we get a Codex OAuth code for free.
+        if post_otp_page == "add_phone":
+            logger.info("[oauth] %s - post-OTP is add_phone, trying phone skip", email)
+            ps = session.post(PHONE_SKIP_URL, headers=hdrs, timeout=30)
+            if ps.status_code == 200:
+                post_otp_resp = _safe_json(ps)
+                post_otp_page = (post_otp_resp.get("page") or {}).get("type", "")
+                post_otp_cont = post_otp_resp.get("continue_url", "")
+                logger.info("[oauth] %s - phone skip OK, page=%s continue=%s",
+                            email, post_otp_page, post_otp_cont[:150])
+            else:
+                logger.info("[oauth] %s - phone skip failed HTTP %d; body=%s",
+                            email, ps.status_code, (ps.text or "")[:200])
+
+        # If we got a continue_url (e.g. direct codex callback), follow it
+        # right now for the auth code — don't rely on cookie workspace path.
+        if post_otp_cont and "?code=" in post_otp_cont:
+            logger.info("[oauth] %s - direct code in continue_url, following",
+                        email)
+            code, st = _follow_redirects(session, post_otp_cont)
+            if code:
+                return code, st, None
+        elif post_otp_cont and "chatgpt.com" in post_otp_cont:
+            logger.info("[oauth] %s - following chatgpt callback", email)
+            code, st = _follow_redirects(session, post_otp_cont)
+            if code:
+                return code, st, None
+
         # 6) Workspace + redirects
         auth_cookie = _get_cookie(session, "oai-client-auth-session")
         if auth_cookie:
