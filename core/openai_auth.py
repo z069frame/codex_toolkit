@@ -362,7 +362,16 @@ def register_account(
             except Exception as e:
                 logger.info("[register] %s - page-load warn: %s", email, e)
 
-            # 5) Set password (POST /api/accounts/user/register)
+            # 4.6) Get a 2nd sentinel with flow="username_password_create".
+            # This signals to OpenAI's server "we're creating a new account"
+            # vs "we're logging into an existing account". Without this the
+            # server later refuses /create_account with invalid_auth_step.
+            logger.info("[register] %s - fetching sentinel (flow=username_password_create)", email)
+            pwd_sentinel_token, pwd_sentinel_header = _get_sentinel(
+                session, did, "username_password_create")
+
+            # 5) Set password (POST /api/accounts/user/register) — attach
+            # username_password_create sentinel header.
             logger.info("[register] %s - setting password", email)
             pwd_hdrs = {
                 "Referer": f"{AUTH_BASE}/create-account/password",
@@ -370,6 +379,8 @@ def register_account(
                 "Accept": "application/json",
                 "Origin": AUTH_BASE,
             }
+            if pwd_sentinel_header:
+                pwd_hdrs["openai-sentinel-token"] = pwd_sentinel_header
             r = session.post(REGISTER_URL, headers=pwd_hdrs,
                              data=json.dumps({"password": password, "username": email}),
                              timeout=30)
