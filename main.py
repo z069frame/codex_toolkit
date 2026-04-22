@@ -178,42 +178,37 @@ def cmd_register(cfg, args):
         else:
             print(f"  ⚠️  DM verify: not found (non-fatal)")
 
-        # Phase 3: populate CPA-Free with the auth token.
-        # CPA OAuth uses the Codex client (app_EMoamEEZ...) which hits add_phone
-        # on new accounts without phone verified. If we only obtained AT via the
-        # ChatGPT NextAuth fallback (phone_required=True), OAuth will fail —
-        # skip it and upload the session AT directly instead (no RT, expires ~7d).
-        # Preferred: CPA OAuth (gets refresh_token for auto-renewal).
-        # Fallback: direct upload of session AT (no RT, ~7d expiry).
-        if at:
-            cpa_ok = False
+        # Phase 3: populate CPA-Free with the auth token — but only when we
+        # have a real Codex-client AT. ChatGPT NextAuth session AT
+        # (phone-blocked fallback) is rejected by /backend-api/codex/* with
+        # 401, so uploading it just pollutes the pool. Phone-blocked
+        # accounts stay in DM awaiting Team upgrade via oauth-multi.
+        cpa_ok = False
+        if at and not phone_required:
+            print(f"  → Starting CPA OAuth (free token)...")
+            oauth_result = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
+            cpa_ok = oauth_result.get("ok", False)
+            if cpa_ok:
+                print(f"  ✅ CPA OAuth complete (with refresh_token)")
+            else:
+                err = str(oauth_result.get("error", ""))
+                print(f"  ⚠️  CPA OAuth failed: {err[:200]}")
 
-            # Try OAuth unless we already know phone will block
-            if not phone_required:
-                print(f"  → Starting CPA OAuth (free token)...")
-                oauth_result = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
-                cpa_ok = oauth_result.get("ok", False)
-                if cpa_ok:
-                    print(f"  ✅ CPA OAuth complete (with refresh_token)")
-                else:
-                    err = str(oauth_result.get("error", ""))
-                    phone_related = any(x in err for x in (
-                        "no_code_extracted", "add_phone", "invalid_auth_step"))
-                    if not phone_related:
-                        print(f"  ⚠️  CPA OAuth failed (non-phone): {err}")
-
-            # Fallback: direct upload when OAuth failed or was skipped
+            # Fallback: direct upload of the real PKCE Codex AT we already have
             if not cpa_ok:
-                reason = "phone-blocked" if phone_required else "OAuth failed"
-                print(f"  → Uploading session AT to CPA-Free (fallback, {reason})...")
-                up = cpa_mgmt.upload_codex_auth(email=email, access_token=at)
+                print(f"  → Uploading PKCE AT to CPA-Free...")
+                up = cpa_mgmt.upload_codex_auth(email=email, access_token=at,
+                                                 refresh_token=rt)
                 cpa_ok = up.get("ok", False)
                 if cpa_ok:
                     cpa_mgmt.set_priority(up["name"], 100)
                     cpa_mgmt.set_websockets(up["name"], True)
-                    print(f"  ✅ CPA upload: {up['name']} (priority=100, ws=on; no RT)")
+                    print(f"  ✅ CPA upload: {up['name']} (priority=100, ws=on)")
                 else:
                     print(f"  ⚠️  CPA upload failed: {up.get('error') or up.get('status')}")
+        elif at:
+            print(f"  ⏭️ Skipping CPA upload — no Codex-client AT "
+                  f"(phone-blocked); account waits in DM for Team upgrade")
 
         results.append({
             "email": email,
