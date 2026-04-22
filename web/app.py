@@ -287,6 +287,15 @@ class TestAtReq(BaseModel):
     proxy: Optional[str] = None
 
 
+class ProbeClientReq(BaseModel):
+    """Diagnostic: visit an OAuth authorize URL for a given client_id and
+    report what OpenAI's Hydra responds with (landing page, cookies, etc).
+    Useful for identifying which OAuth flow a new client_id expects."""
+    client_id: str
+    redirect_uri: str = "http://localhost:1455/auth/callback"
+    proxy: Optional[str] = None
+
+
 class OAuthFreeReq(BaseModel):
     email: Optional[str] = None
     count: int = 0
@@ -2104,6 +2113,81 @@ async def api_subscribe_flow(req: SubscribeFlowReq):
     task_id = _create_task("subscribe-flow", req.model_dump())
     threading.Thread(target=_run_subscribe_flow, args=(task_id, req), daemon=True).start()
     return {"task_id": task_id}
+
+
+@app.post("/api/probe-client")
+async def api_probe_client(req: ProbeClientReq):
+    """Visit an OAuth authorize URL for the given client_id and report
+    what OpenAI Hydra responds with. Tells us if this is a valid client,
+    what flow it expects (password / SSO / device code / custom), and
+    whether the redirect_uri matches the app registration."""
+    from core.openai_auth import _build_oauth_url, _gen_pkce, _gen_state, _create_session
+
+    cv, cc = _gen_pkce()
+    state = _gen_state()
+    try:
+        auth_url = _build_oauth_url(req.client_id, req.redirect_uri, cc, state)
+    except Exception as e:
+        raise HTTPException(500, f"build_url: {e}")
+
+    proxy = _get_proxy(req.proxy, "probe-client")
+    session, _ = _create_session(proxy)
+    out: dict[str, Any] = {
+        "client_id": req.client_id,
+        "redirect_uri": req.redirect_uri,
+        "authorize_url": auth_url[:200],
+    }
+
+    try:
+        r = session.get(auth_url, timeout=30, allow_redirects=True)
+        out["initial_visit"] = {
+            "final_url": (r.url or "")[:300],
+            "http": r.status_code,
+            "body_snippet": (r.text or "")[:800],
+        }
+        # Check what cookies OpenAI set (these hint at the flow type)
+        cookies_set = [c.name for c in session.cookies.jar
+                       if "openai.com" in c.domain or "chatgpt.com" in c.domain]
+        out["cookies_set"] = cookies_set
+
+        # Also try POSTing email (simulates first step of password flow)
+        sentinel_resp = None
+        try:
+            did = ""
+            for c in session.cookies.jar:
+                if c.name == "oai-did":
+                    did = c.value
+                    break
+            from core.openai_auth import _get_sentinel, SIGNUP_URL, AUTH_BASE
+            _, sh = _get_sentinel(session, did, "authorize_continue")
+            sentinel_resp = {"ok": True, "header_len": len(sh) if sh else 0}
+            hdrs = {"Referer": f"{AUTH_BASE}/log-in",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"}
+            if sh:
+                hdrs["openai-sentinel-token"] = sh
+            er = session.post(SIGNUP_URL, headers=hdrs,
+                              data=json.dumps({
+                                  "username": {"value": "probe-email@test.invalid",
+                                               "kind": "email"},
+                                  "screen_hint": "signup"}),
+                              timeout=20)
+            out["email_probe"] = {
+                "http": er.status_code,
+                "body_snippet": (er.text or "")[:400],
+            }
+        except Exception as e:
+            out["email_probe"] = {"error": str(e)[:200]}
+
+        out["sentinel"] = sentinel_resp
+    except Exception as e:
+        out["error"] = str(e)[:300]
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+    return out
 
 
 @app.post("/api/test-at")
