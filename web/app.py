@@ -752,16 +752,34 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
     at = reg["access_token"]
     rt = reg["refresh_token"]
 
+    # Track Codex-client tokens separately — these are what Codex backend-api
+    # actually accepts. ChatGPT NextAuth AT is rejected by /backend-api/codex/*
+    # with 401, so without a Codex-client AT, CPA proxy fails on every Codex call.
+    codex_at = ""
+    codex_rt = ""
+    codex_id_token = ""
+
     if phone_required:
         _log(task_id, f"⚠️ {email}: phone required, trying session fallback")
         sess = get_chatgpt_session_at(email, password, otp_token, proxy)
         if sess["ok"]:
             at = sess["access_token"]
-            _log(task_id, f"✅ {email}: session AT obtained (len={len(at)})")
+            codex_at = sess.get("codex_access_token", "") or ""
+            codex_rt = sess.get("codex_refresh_token", "") or ""
+            codex_id_token = sess.get("codex_id_token", "") or ""
+            if codex_at:
+                _log(task_id, f"✅ {email}: session AT + piggyback Codex AT obtained "
+                              f"(session_at={len(at)}, codex_at={len(codex_at)}, codex_rt={len(codex_rt)})")
+            else:
+                _log(task_id, f"✅ {email}: session AT obtained (len={len(at)}); "
+                              f"⚠️ piggyback Codex PKCE failed — account won't work for Codex API")
         else:
             _log(task_id, f"⚠️ {email}: session failed: {sess['error']}")
     else:
         _log(task_id, f"✅ {email}: registered (AT={len(at)}, RT={len(rt)})")
+        # Not phone-blocked — the reg AT already is Codex-client
+        codex_at = at
+        codex_rt = rt
 
     chatgpt_rt = ""
     if req.rt:
@@ -812,7 +830,14 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
                 if not phone_related:
                     _log(task_id, f"⚠️ {email}: CPA OAuth failed: {err[:150]}")
         if not cpa_ok:
-            up = cpa_mgmt.upload_codex_auth(email=email, access_token=at)
+            # Prefer the Codex-client AT if we got one via piggyback — it's
+            # the only kind the /backend-api/codex/* endpoints accept.
+            upload_at = codex_at or at
+            upload_rt = codex_rt
+            upload_id = codex_id_token
+            up = cpa_mgmt.upload_codex_auth(email=email, access_token=upload_at,
+                                             refresh_token=upload_rt,
+                                             id_token=upload_id)
             cpa_ok = up.get("ok", False)
             if cpa_ok:
                 cpa_mgmt.set_priority(up["name"], 100)

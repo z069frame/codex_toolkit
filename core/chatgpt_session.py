@@ -447,6 +447,71 @@ def get_chatgpt_session_at(
 
         logger.info("[chatgpt] %s - SUCCESS! Full-permission AT (len=%d)", email, len(at_from_session))
 
+        # ── Step 11: Piggyback Codex PKCE OAuth on the active session ──
+        # The Codex API endpoint (/backend-api/codex/*) rejects tokens issued
+        # by the ChatGPT NextAuth client (`app_X8zY6vW2pQ9tR3dE7nK1jL5gH`).
+        # It only accepts tokens from the Codex public client
+        # (`app_EMoamEEZ73f0CkXaXp7hrann`). To bypass phone gate for fresh
+        # accounts, we do NextAuth first (which skips phone via about_you),
+        # then reuse the authenticated session cookies on auth.openai.com to
+        # request a Codex PKCE code — Hydra recognizes the existing session
+        # and issues the code without prompting for phone.
+        codex_at = ""
+        codex_rt = ""
+        codex_id_token = ""
+        try:
+            cv, cc = _gen_pkce()
+            cx_state = _gen_state()
+            cx_url = _build_oauth_url(CODEX_CLIENT_ID, CODEX_REDIRECT_URI,
+                                      cc, cx_state)
+            logger.info("[chatgpt] %s - piggyback Codex PKCE on existing session", email)
+            # Visit authorize URL; Hydra should recognize the session cookies
+            # already present on .auth.openai.com and redirect straight to the
+            # redirect_uri with ?code=...
+            pr = session.get(cx_url, timeout=30, allow_redirects=True)
+            final_url = pr.url or ""
+            code = ""
+            if "code=" in final_url:
+                qs = parse_qs(urlparse(final_url).query)
+                code = (qs.get("code") or [""])[0]
+            if not code:
+                # Some flows land on /sign-in-with-chatgpt/codex/consent or
+                # /workspace — try submitting workspace-select to progress.
+                page_body = (pr.text or "")[:500]
+                logger.info("[chatgpt] %s - piggyback Codex landed: %s body=%s",
+                             email, final_url[:150], page_body[:200])
+            if code:
+                logger.info("[chatgpt] %s - piggyback got code (len=%d), exchanging",
+                             email, len(code))
+                tr = cffi_requests.post(
+                    TOKEN_URL,
+                    data=urlencode({
+                        "grant_type": "authorization_code",
+                        "client_id": CODEX_CLIENT_ID,
+                        "code": code,
+                        "redirect_uri": CODEX_REDIRECT_URI,
+                        "code_verifier": cv,
+                    }),
+                    headers={"Content-Type": "application/x-www-form-urlencoded",
+                             "Accept": "application/json"},
+                    impersonate="chrome136",
+                    proxies=session.proxies if hasattr(session, 'proxies') else None,
+                    timeout=30,
+                )
+                if tr.status_code == 200:
+                    td = _safe_json(tr)
+                    codex_at = td.get("access_token", "")
+                    codex_rt = td.get("refresh_token", "")
+                    codex_id_token = td.get("id_token", "")
+                    logger.info("[chatgpt] %s - piggyback Codex AT obtained "
+                                 "(AT=%d, RT=%d, id=%d)",
+                                 email, len(codex_at), len(codex_rt), len(codex_id_token))
+                else:
+                    logger.warning("[chatgpt] %s - piggyback token exchange HTTP %d: %s",
+                                   email, tr.status_code, (tr.text or "")[:200])
+        except Exception as e:
+            logger.warning("[chatgpt] %s - piggyback Codex PKCE failed: %s", email, e)
+
         return {
             "ok": True,
             "access_token": at_from_session,
@@ -454,6 +519,11 @@ def get_chatgpt_session_at(
             "user": result.get("user", {}),
             "expires": result.get("expires"),
             "email": email,
+            # Codex-client tokens (when piggyback succeeds). When present,
+            # use these for CPA uploads — they pass Codex backend-api auth.
+            "codex_access_token": codex_at,
+            "codex_refresh_token": codex_rt,
+            "codex_id_token": codex_id_token,
         }
 
     except Exception as e:
