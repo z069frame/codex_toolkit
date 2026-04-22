@@ -397,14 +397,37 @@ def register_account(
                 page_type = (resp.get("page") or {}).get("type", "")
                 logger.info("[register] %s - phone skip OK, page=%s", email, page_type)
             else:
-                logger.warning("[register] %s - phone skip failed (HTTP %d), account created without tokens",
-                               email, r.status_code)
-                return {
-                    "ok": True,
-                    "access_token": "",
-                    "refresh_token": "",
-                    "phone_required": True,
-                }
+                # Phone skip returns 404 on newer OpenAI rollouts where the
+                # endpoint was removed. Try posting about_you (create_account)
+                # directly — NextAuth's ChatGPT flow proves this path bypasses
+                # phone for brand-new accounts, and the same seems to work on
+                # the Codex client flow.
+                logger.info("[register] %s - phone skip failed (HTTP %d), "
+                            "trying about_you fallback", email, r.status_code)
+                ab = session.post(
+                    CREATE_URL, headers=hdrs,
+                    data=json.dumps({"name": random_display_name(),
+                                     "birthdate": random_birthdate()}),
+                    timeout=30,
+                )
+                if ab.status_code == 200:
+                    resp = _safe_json(ab)
+                    page_type = (resp.get("page") or {}).get("type", "")
+                    logger.info("[register] %s - about_you OK, page=%s, "
+                                "continue_url=%s", email, page_type,
+                                (resp.get("continue_url") or "")[:120])
+                    # Prevent step 9 from re-POSTing about_you on the same flow
+                    is_existing = True
+                else:
+                    logger.warning("[register] %s - about_you fallback failed "
+                                   "(HTTP %d): %s | account created without tokens",
+                                   email, ab.status_code, (ab.text or "")[:200])
+                    return {
+                        "ok": True,
+                        "access_token": "",
+                        "refresh_token": "",
+                        "phone_required": True,
+                    }
 
         # 9) Create account profile (new only)
         if not is_existing and page_type in ("create_account", "about_you", ""):
