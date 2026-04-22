@@ -885,10 +885,15 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
         err_snippet = str(dm_res.get("error") or dm_res.get("raw") or dm_res)[:200]
         _log(task_id, f"⚠️ {email}: DM failed — status={dm_res.get('status')} {err_snippet}")
 
-    # CPA: prefer OAuth (for refresh_token), fallback to direct upload when
-    # phone-blocked or OAuth unavailable.
+    # CPA upload — only when we have a Codex-client AT. The ChatGPT NextAuth
+    # session AT (phone-blocked fallback) is rejected by /backend-api/codex/*
+    # with 401 Unauthorized, so uploading it just pollutes CPA's free pool
+    # with dead entries. Those accounts still sit in DM for future Team
+    # upgrade (where oauth-multi produces a usable team-client AT).
     cpa_ok = False
-    if at:
+    if codex_at:
+        # Normal OAuth path (phone-passing) — try OAuth first for refresh_token,
+        # fall back to direct upload with the Codex-client AT we already have.
         if not phone_required:
             cpa_res = _do_cpa_mgmt_oauth(cpa_mgmt, email, password, otp_token, proxy)
             cpa_ok = cpa_res.get("ok", False)
@@ -901,21 +906,19 @@ def _register_one(task_id: str, req: RegisterReq, dm, cpa_mgmt,
                 if not phone_related:
                     _log(task_id, f"⚠️ {email}: CPA OAuth failed: {err[:150]}")
         if not cpa_ok:
-            # Prefer the Codex-client AT if we got one via piggyback — it's
-            # the only kind the /backend-api/codex/* endpoints accept.
-            upload_at = codex_at or at
-            upload_rt = codex_rt
-            upload_id = codex_id_token
-            up = cpa_mgmt.upload_codex_auth(email=email, access_token=upload_at,
-                                             refresh_token=upload_rt,
-                                             id_token=upload_id)
+            up = cpa_mgmt.upload_codex_auth(email=email, access_token=codex_at,
+                                             refresh_token=codex_rt,
+                                             id_token=codex_id_token)
             cpa_ok = up.get("ok", False)
             if cpa_ok:
                 cpa_mgmt.set_priority(up["name"], 100)
                 cpa_mgmt.set_websockets(up["name"], True)
-                _log(task_id, f"✅ {email}: CPA upload {up['name']} (prio=100, ws=on; no RT)")
+                _log(task_id, f"✅ {email}: CPA upload {up['name']} (prio=100, ws=on)")
             else:
                 _log(task_id, f"⚠️ {email}: CPA upload failed — {up.get('error') or up.get('status')}")
+    elif at:
+        _log(task_id, f"⏭️ {email}: skipping CPA upload — no Codex-client AT "
+                      f"(phone-blocked); account waits in DM for Team upgrade")
 
     return {"email": email, "ok": True, "phone_required": phone_required,
             "has_at": bool(at), "dm_ok": dm_ok, "cpa_ok": cpa_ok}
