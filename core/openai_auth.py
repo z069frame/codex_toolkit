@@ -152,26 +152,54 @@ def _build_oauth_url(client_id, redirect_uri, code_challenge, state):
     })
 
 
+# Pre-computed browser fingerprint that OpenAI's sentinel accepts for the
+# username_password_create flow. Reference impl (lxf746/any-auto-register)
+# uses this verbatim — any fresh compute is rejected.
+_USERNAME_PASSWORD_CREATE_P = (
+    "gAAAAACWzMwMDAsIlN1biBBcHIgMDUgMjAyNiAxNDowMzowMiBHTVQrMDgwMCAo5Lit5Zu95qCH5YeG5pe26Ze0KSIs"
+    "NDI5NDk2NzI5Niw1LCJNb3ppbGxhLzUuMCAoTWFjaW50b3NoOyBJbnRlbCBNYWMgT1MgWCAxMF8xNV83KSBBcHBsZVdl"
+    "YktpdC81MzcuMzYgKEtIVE1MLCBsaWtlIEdlY2tvKSBDaHJvbWUvMTQ2LjAuMC4wIFNhZmFyaS81MzcuMzYiLCJodHRw"
+    "czovL3NlbnRpbmVsLm9wZW5haS5jb20vYmFja2VuZC1hcGkvc2VudGluZWwvc2RrLmpzIixudWxsLCJ6aC1DTiIsInpo"
+    "LUNOLHpoIiw0LCJ3ZWJraXRUZW1wb3JhcnlTdG9yYWdl4oiSW29iamVjdCBEZXByZWNhdGVkU3RvcmFnZVF1b3RhXSIs"
+    "Il9yZWFjdExpc3RlbmluZ3dvMnk1YXV0eG1uIiwib25zY3JvbGxlbmQiLDIzOTQuNSwiYTY4OTQ0ZWYtZjI2Yi00MTc4"
+    "LWEwNTItZjE0NGZjOTYwMzgxIiwiIiwyLDE3NzUzNjg5Nzk2NjQuNiwwLDAsMCwwLDAsMCwwXQ==~S"
+)
+
+
 def _get_sentinel(session, did, flow):
     """Call sentinel API -> return (sentinel_token, sentinel_header_json).
 
-    Computes a real PoW token via SHA3-512 brute force and submits it
-    through the active session so cookies/TLS fingerprint stay consistent.
-    Empty PoW was rejected by the server and caused 400 errors on later
-    steps (e.g. password /user/register).
+    For `authorize_continue` (first call): compute a real PoW token via
+    SHA3-512 brute force and submit it as `p`.
+
+    For `username_password_create` (password step): use the fixed
+    browser-fingerprint `p` the reference impl hardcodes. OpenAI's sentinel
+    for this flow validates against a specific fingerprint shape rather
+    than a PoW — our computed PoW gets accepted by the sentinel service
+    (HTTP 200) but the resulting header is rejected downstream on /create_account.
+
+    Header format matches the reference impl: {p, t, c, id, flow} where
+    - p = the `p` we SENT in the sentinel request (or returned `p` if present)
+    - t = turnstile.dx from response
+    - c = the `token` returned by sentinel
+    This is what OpenAI's /user/register and /create_account validate.
     """
     ua = session.headers.get("user-agent") or session.headers.get("User-Agent") \
         or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    try:
-        pow_token = build_sentinel_pow_token(ua)
-    except Exception as e:
-        logger.warning("Sentinel PoW solve failed: %s", e)
-        return None, None
+    # Pick the right `p` per flow
+    if flow == "username_password_create":
+        sent_p = _USERNAME_PASSWORD_CREATE_P
+    else:
+        try:
+            sent_p = build_sentinel_pow_token(ua)
+        except Exception as e:
+            logger.warning("Sentinel PoW solve failed: %s", e)
+            return None, None
 
     sentinel_body = json.dumps(
-        {"p": pow_token, "id": did, "flow": flow},
+        {"p": sent_p, "id": did, "flow": flow},
         separators=(",", ":"),
     )
     try:
@@ -186,11 +214,21 @@ def _get_sentinel(session, did, flow):
             timeout=30,
         )
         if resp.status_code == 200:
-            token = (resp.json() or {}).get("token")
+            data = resp.json() or {}
+            token = data.get("token") or ""
             if token:
-                header = json.dumps(
-                    {"p": "", "t": "", "c": token, "id": did, "flow": flow}
-                )
+                # Mirror reference impl: preserve sent_p (or server-returned p)
+                # plus turnstile.dx in the outgoing header.
+                resp_p = data.get("p") or sent_p
+                turnstile = data.get("turnstile") or {}
+                turnstile_dx = turnstile.get("dx", "") or ""
+                header = json.dumps({
+                    "p": resp_p,
+                    "t": turnstile_dx,
+                    "c": token,
+                    "id": did,
+                    "flow": flow,
+                }, separators=(",", ":"))
                 return token, header
             logger.warning("Sentinel API returned no token: %s", resp.text[:200])
         else:
