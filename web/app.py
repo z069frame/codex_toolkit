@@ -2182,7 +2182,7 @@ async def api_test_at(req: TestAtReq):
     except Exception as e:
         results["accounts_check"] = {"error": str(e)[:200]}
 
-    # Test B: actual Codex completion request
+    # Test B: ChatGPT-hosted Codex endpoint (what CPA currently proxies)
     try:
         r = s.post("https://chatgpt.com/backend-api/codex/responses",
                    headers={"Authorization": f"Bearer {at}",
@@ -2196,6 +2196,7 @@ async def api_test_at(req: TestAtReq):
                                   "content": [{"type": "input_text",
                                                "text": req.prompt}]}],
                        "stream": False,
+                       "instructions": "You are a helpful assistant. Reply very briefly.",
                    },
                    timeout=60)
         results["codex_responses"] = {
@@ -2204,6 +2205,67 @@ async def api_test_at(req: TestAtReq):
         }
     except Exception as e:
         results["codex_responses"] = {"error": str(e)[:200]}
+
+    # Test C: Public API endpoint (api.openai.com/v1/responses)
+    try:
+        r = s.post("https://api.openai.com/v1/responses",
+                   headers={"Authorization": f"Bearer {at}",
+                            "Content-Type": "application/json",
+                            "OpenAI-Beta": "responses=experimental"},
+                   json={
+                       "model": req.model,
+                       "input": req.prompt,
+                       "stream": False,
+                   },
+                   timeout=60)
+        results["api_v1_responses"] = {
+            "http": r.status_code,
+            "body_snippet": (r.text or "")[:600],
+        }
+    except Exception as e:
+        results["api_v1_responses"] = {"error": str(e)[:200]}
+
+    # Test D: Public API /v1/chat/completions (common fallback)
+    try:
+        r = s.post("https://api.openai.com/v1/chat/completions",
+                   headers={"Authorization": f"Bearer {at}",
+                            "Content-Type": "application/json"},
+                   json={
+                       "model": req.model,
+                       "messages": [{"role": "user", "content": req.prompt}],
+                       "stream": False,
+                   },
+                   timeout=60)
+        results["api_v1_chat"] = {
+            "http": r.status_code,
+            "body_snippet": (r.text or "")[:600],
+        }
+    except Exception as e:
+        results["api_v1_chat"] = {"error": str(e)[:200]}
+
+    # Test E: ChatGPT web conversation endpoint
+    try:
+        r = s.post("https://chatgpt.com/backend-api/conversation",
+                   headers={"Authorization": f"Bearer {at}",
+                            "Content-Type": "application/json",
+                            "Accept": "text/event-stream",
+                            "ChatGPT-Account-ID": account_id},
+                   json={
+                       "action": "next",
+                       "messages": [{"id": "msg-1",
+                                     "author": {"role": "user"},
+                                     "content": {"content_type": "text",
+                                                 "parts": [req.prompt]}}],
+                       "model": req.model,
+                       "parent_message_id": "00000000-0000-0000-0000-000000000000",
+                   },
+                   timeout=60)
+        results["chatgpt_conversation"] = {
+            "http": r.status_code,
+            "body_snippet": (r.text or "")[:600],
+        }
+    except Exception as e:
+        results["chatgpt_conversation"] = {"error": str(e)[:200]}
 
     return results
 
