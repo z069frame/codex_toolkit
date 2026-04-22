@@ -385,60 +385,48 @@ def register_account(
         if r.status_code != 200:
             return {"ok": False, "error": f"otp_validate_{r.status_code}"}
 
-        # 8) Handle add_phone (may appear after OTP for new accounts)
+        # 8) Create user account — POST name/birthdate with Referer=/about-you.
+        # Do NOT check page_type first: OpenAI's state machine seems to gate
+        # "create_account is allowed" by the Referer header rather than the
+        # current page. Checking page_type and then trying phone_skip first
+        # puts the server into add_phone state, from which create_account
+        # returns "invalid_auth_step". The reference implementation
+        # (lxf746/any-auto-register) proves that POSTing create_account
+        # directly with Referer=/about-you bypasses the phone gate for new
+        # accounts on the Codex public client. Skip for existing-account
+        # logins (they don't need profile creation).
         resp = _safe_json(r)
-        page_type = (resp.get("page") or {}).get("type", "")
-
-        if page_type == "add_phone":
-            logger.info("[register] %s - phone step, trying to skip", email)
-            r = session.post(PHONE_SKIP_URL, headers=hdrs, timeout=30)
-            if r.status_code == 200:
-                resp = _safe_json(r)
-                page_type = (resp.get("page") or {}).get("type", "")
-                logger.info("[register] %s - phone skip OK, page=%s", email, page_type)
-            else:
-                # Phone skip returns 404 on newer OpenAI rollouts where the
-                # endpoint was removed. Try posting about_you (create_account)
-                # directly — NextAuth's ChatGPT flow proves this path bypasses
-                # phone for brand-new accounts, and the same seems to work on
-                # the Codex client flow.
-                logger.info("[register] %s - phone skip failed (HTTP %d), "
-                            "trying about_you fallback", email, r.status_code)
-                ab = session.post(
-                    CREATE_URL, headers=hdrs,
-                    data=json.dumps({"name": random_display_name(),
-                                     "birthdate": random_birthdate()}),
-                    timeout=30,
-                )
-                if ab.status_code == 200:
-                    resp = _safe_json(ab)
-                    page_type = (resp.get("page") or {}).get("type", "")
-                    logger.info("[register] %s - about_you OK, page=%s, "
-                                "continue_url=%s", email, page_type,
-                                (resp.get("continue_url") or "")[:120])
-                    # Prevent step 9 from re-POSTing about_you on the same flow
-                    is_existing = True
-                else:
-                    logger.warning("[register] %s - about_you fallback failed "
-                                   "(HTTP %d): %s | account created without tokens",
-                                   email, ab.status_code, (ab.text or "")[:200])
+        if not is_existing:
+            logger.info("[register] %s - creating user account (name+birthdate)", email)
+            about_hdrs = {
+                "referer": f"{AUTH_BASE}/about-you",
+                "accept": "application/json",
+                "content-type": "application/json",
+            }
+            r = session.post(CREATE_URL, headers=about_hdrs,
+                             data=json.dumps({"name": random_display_name(),
+                                              "birthdate": random_birthdate()}),
+                             timeout=30)
+            if r.status_code != 200:
+                body = (r.text or "")[:300]
+                logger.warning("[register] %s - create_account HTTP %d: %s",
+                               email, r.status_code, body)
+                # Fall back to reporting phone_required so the caller can
+                # still use the session AT path via get_chatgpt_session_at.
+                if "invalid_auth_step" in body or r.status_code == 400:
                     return {
                         "ok": True,
                         "access_token": "",
                         "refresh_token": "",
                         "phone_required": True,
                     }
-
-        # 9) Create account profile (new only)
-        if not is_existing and page_type in ("create_account", "about_you", ""):
-            logger.info("[register] %s - creating account profile", email)
-            r = session.post(CREATE_URL, headers=hdrs,
-                             data=json.dumps({"name": random_display_name(),
-                                              "birthdate": random_birthdate()}),
-                             timeout=30)
-            if r.status_code != 200:
-                return {"ok": False, "error": f"create_account_{r.status_code}: {r.text[:200]}"}
+                return {"ok": False, "error": f"create_account_{r.status_code}: {body}"}
             resp = _safe_json(r)
+            page_type = (resp.get("page") or {}).get("type", "")
+            logger.info("[register] %s - create_account OK, page=%s, continue=%s",
+                         email, page_type,
+                         (resp.get("continue_url") or "")[:120])
+        else:
             page_type = (resp.get("page") or {}).get("type", "")
 
         # === Phase 2: Token exchange (reuse original PKCE, no re-login) ===
