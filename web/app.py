@@ -282,6 +282,14 @@ class TestAtReq(BaseModel):
     proxy: Optional[str] = None
 
 
+class TestRefRegisterReq(BaseModel):
+    """Run the vendored lxf746/any-auto-register flow to see if the reference
+    impl succeeds where ours fails."""
+    email: Optional[str] = None   # auto-generate if None
+    domain: str = "aitech.email"
+    proxy: Optional[str] = None
+
+
 class OAuthFreeReq(BaseModel):
     email: Optional[str] = None
     count: int = 0
@@ -2100,6 +2108,58 @@ async def api_subscribe_flow(req: SubscribeFlowReq):
     task_id = _create_task("subscribe-flow", req.model_dump())
     threading.Thread(target=_run_subscribe_flow, args=(task_id, req), daemon=True).start()
     return {"task_id": task_id}
+
+
+@app.post("/api/test-ref-register")
+async def api_test_ref_register(req: TestRefRegisterReq):
+    """Run the vendored reference-impl registration flow.
+
+    Uses our ProxySeller (or request-override) proxy and our otp-inbox.
+    Returns the reference impl's result + log stream.
+    """
+    from experimental.run_ref_register import run_ref_registration
+
+    proxy = _get_proxy(req.proxy, "test-ref-register")
+
+    # Generate email if not provided
+    import random as _r
+    import datetime as _dt
+    email = (req.email or "").strip()
+    if not email:
+        domain = (req.domain or "aitech.email").lstrip("@")
+        from core.email_gen import FIRST_NAMES
+        name = _r.choice(FIRST_NAMES).lower()
+        date_part = _dt.date.today().strftime("%y%m%d")
+        rand_part = f"{_r.randint(0, 999):03d}"
+        email = f"{name}{date_part}{rand_part}@{domain}"
+
+    inbox_base = "https://otp-inbox.z069frame.workers.dev"
+    inbox_token = CFG.get("otp_token", "")
+
+    task_id = _create_task("test-ref-register",
+                            {"email": email, "proxy_mask": _mask_proxy(proxy)})
+
+    def _worker():
+        try:
+            result = run_ref_registration(
+                email=email, proxy_url=proxy,
+                inbox_base=inbox_base, inbox_token=inbox_token)
+            for ln in result.get("logs", []):
+                _log(task_id, ln)
+            _log(task_id, f"[RESULT] success={result.get('success')} "
+                          f"error={result.get('error','')[:150]}")
+            if result.get("has_at"):
+                claims = result.get("claims", {})
+                _log(task_id, f"[AT] len={result.get('access_token_len')} "
+                              f"client_id={claims.get('client_id')} "
+                              f"plan={claims.get('chatgpt_plan_type')}")
+            _finish(task_id, result, "done" if result.get("success") else "error")
+        except Exception as e:
+            _log(task_id, f"[ERROR] {e}")
+            _finish(task_id, {"error": str(e)}, "error")
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"task_id": task_id, "email": email}
 
 
 @app.post("/api/test-at")
