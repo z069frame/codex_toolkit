@@ -74,21 +74,47 @@ class _OtpInboxEmailService:
 
     def get_verification_code(self, email=None, email_id=None, timeout=120,
                               pattern=None, otp_sent_at=None):
+        """Matches our core.otp.inbox_provider URL pattern:
+        GET https://m.{domain}/api/latest?to=<email>&otp_only=1&format=json
+        """
         import re as _re
         start = time.time()
         seen = set()
         pat = _re.compile(pattern or r"(?<!\d)(\d{6})(?!\d)")
         target = email or self.email
+        domain = (target.split("@", 1)[1] if "@" in target else "").lower()
         while time.time() - start < timeout:
             try:
                 q = urllib.parse.urlencode({
                     "to": target, "otp_only": "1", "format": "json"})
-                url = f"{self._inbox_base}/api/emails/latest?{q}"
+                url = f"https://m.{domain}/api/latest?{q}"
                 req = urllib.request.Request(
                     url, headers={"Authorization": f"Bearer {self._inbox_token}"})
                 with urllib.request.urlopen(req, timeout=10) as r:
-                    body = json.loads(r.read().decode("utf-8", "ignore") or "{}")
-                code = str(body.get("code") or body.get("otp") or "")
+                    raw = r.read().decode("utf-8", "ignore")
+                # body may be either {"code": "123456"} or list of emails
+                try:
+                    body = json.loads(raw)
+                except Exception:
+                    body = raw
+                code = ""
+                if isinstance(body, dict):
+                    code = str(body.get("code") or body.get("otp") or "")
+                    if not code and isinstance(body.get("emails"), list):
+                        for em in body["emails"]:
+                            m = pat.search(str(em.get("body", "")))
+                            if m:
+                                code = m.group(1); break
+                elif isinstance(body, list):
+                    for em in body:
+                        if isinstance(em, dict):
+                            m = pat.search(str(em.get("body", em.get("text", ""))))
+                            if m:
+                                code = m.group(1); break
+                elif isinstance(body, str):
+                    m = pat.search(body)
+                    if m: code = m.group(1)
+
                 if code and pat.match(code) and code not in seen:
                     return code
                 if code:
