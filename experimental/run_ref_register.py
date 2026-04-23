@@ -11,6 +11,7 @@ import time
 import logging
 import secrets
 import base64
+import importlib.util
 import urllib.request
 import urllib.parse
 from typing import Optional
@@ -23,6 +24,37 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REFAPP_DIR = os.path.join(_THIS_DIR, "refapp")
 if _REFAPP_DIR not in sys.path:
     sys.path.insert(0, _REFAPP_DIR)
+
+
+def _force_load_ref_core_http():
+    """Load refapp/core/http_client.py under the module name 'core.http_client'.
+
+    Our project's 'core' package is already imported at FastAPI startup, so
+    Python's module cache has sys.modules['core'] = our core. When refapp's
+    code does 'from core.http_client import HTTPClient' it hits the cached
+    'core' and finds no http_client submodule → ImportError.
+
+    Workaround: manually load refapp's core/http_client.py, register it under
+    sys.modules['core.http_client'], and attach it to the cached 'core'
+    module's attributes so both access patterns work.
+    """
+    if "core.http_client" in sys.modules:
+        return
+    path = os.path.join(_REFAPP_DIR, "core", "http_client.py")
+    if not os.path.exists(path):
+        raise ImportError(f"refapp core/http_client.py not found at {path}")
+    spec = importlib.util.spec_from_file_location("core.http_client", path)
+    mod = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec so re-entrant imports see it
+    sys.modules["core.http_client"] = mod
+    # Also ensure 'core' exists with a __path__ the loader can reach;
+    # our real 'core' is already there, just pin http_client onto it.
+    spec.loader.exec_module(mod)
+    import core as _our_core  # noqa — our own core; add http_client attr
+    setattr(_our_core, "http_client", mod)
+
+
+_force_load_ref_core_http()
 
 
 class _OtpInboxEmailService:
