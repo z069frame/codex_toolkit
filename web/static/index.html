@@ -801,7 +801,7 @@
       <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
         Generate ChatGPT checkout link. Leave email blank to auto-pick an unsubscribed account with valid AT.
         Use <b>Redirect (old)</b> for standalone Stripe URLs (no login needed).
-        Check <b>🅿️ PayPal submit</b> (DE only) to auto-bind through PayPal via the sidecar service.
+        Check <b>🅿️ PayPal submit</b> (DE only) — the server will run the Stripe Checkout flow and return a PayPal authorization URL; you open that URL manually to log in + approve.
       </p>
       <div class="form-row">
         <div class="form-group"><label>Plan</label>
@@ -1470,11 +1470,6 @@ async function doPay() {
       bulkBar.style.display = 'flex';
       updateBulkStatus();
     }
-    if (paypal_submit && !data.paypal_service_configured && data.paypal_enabled) {
-      const note = document.createElement('div');
-      note.innerHTML = '<div style="color:var(--warning, orange); padding:8px; font-size:0.85rem">⚠️ PAYPAL_SERVICE_URL not set on server — per-row shell commands shown below can be run locally instead</div>';
-      box.prepend(note);
-    }
   } catch(e) { box.innerHTML = '<span class="err">Failed: ' + _escHTML(e.message) + '</span>'; }
 }
 
@@ -1575,14 +1570,10 @@ async function payPalOne(idx) {
   });
   const data = await resp.json();
   const s = document.getElementById('pay-bulk-status');
-  if (!data.configured) {
-    s.innerHTML = `⚠️ PAYPAL_SERVICE_URL not configured. Command:`;
-    const pre = document.createElement('pre');
-    pre.style.cssText = 'background:var(--bg); padding:8px; border-radius:4px; font-size:0.75rem; margin-top:4px; user-select:all';
-    pre.textContent = data.command || '(no command)';
-    s.appendChild(pre);
-  } else if (data.task_id) {
-    s.innerHTML = `🅿️ <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">paypal task ${data.task_id.substring(0,8)}</a>`;
+  if (data.task_id) {
+    s.innerHTML = `🅿️ <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">paypal task ${data.task_id.substring(0,8)}</a> — check Tasks tab for the PayPal auth URL`;
+  } else {
+    s.textContent = 'Failed: ' + JSON.stringify(data);
   }
 }
 
@@ -1592,7 +1583,6 @@ async function bulkPayPal() {
   const s = document.getElementById('pay-bulk-status');
   s.textContent = `Starting ${rows.length} PayPal submissions...`;
   const taskLinks = [];
-  let commandList = [];
   for (const row of rows) {
     try {
       const resp = await fetch(API + '/api/pay-paypal', {
@@ -1602,17 +1592,13 @@ async function bulkPayPal() {
       const data = await resp.json();
       if (data.task_id) {
         taskLinks.push(`<a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">${row.email.substring(0,15)}</a>`);
-      } else if (data.command) {
-        commandList.push(data.command);
       }
     } catch(e) {
       taskLinks.push(`<span style="color:red">${row.email}: ${e.message}</span>`);
     }
   }
-  if (commandList.length) {
-    s.innerHTML = `⚠️ PayPal service not configured. Run locally:<pre style="background:var(--bg); padding:8px; border-radius:4px; font-size:0.75rem; margin-top:4px; user-select:all">${commandList.join('\n')}</pre>`;
-  } else if (taskLinks.length) {
-    s.innerHTML = `🅿️ Tasks: ${taskLinks.join(', ')}`;
+  if (taskLinks.length) {
+    s.innerHTML = `🅿️ ${taskLinks.length} tasks started: ${taskLinks.join(', ')} — check Tasks for PayPal URLs`;
   }
 }
 

@@ -2100,9 +2100,8 @@ async def api_pay(req: PayReq):
                 if tc != "team" and c.get("id"):
                     dm.patch_account(c["id"], {"token_context": "unknown"})
 
-    # Auto-submit via PayPal service: country must be DE (PayPal-EUR flow).
+    # Auto-submit via PayPal: country must be DE (PayPal-EUR billing flow).
     paypal_do = req.paypal_submit and req.country.upper() == "DE"
-    paypal_service = os.environ.get("PAYPAL_SERVICE_URL", "").strip()
 
     results = []
     for acc in accounts:
@@ -2121,90 +2120,110 @@ async def api_pay(req: PayReq):
                    "workspace": r.get("workspace_name"),
                    "plan": r.get("plan"), "ui_mode": r.get("ui_mode")}
 
-            # Kick off PayPal submit asynchronously if enabled + DE + service configured
+            # Kick off inline PayPal submission in a background thread so
+            # the /api/pay response doesn't block for 30+s per account.
             if paypal_do:
-                if paypal_service:
-                    pp_task_id = _create_task("pay-paypal",
-                                               {"email": email, "checkout_url": link})
-                    threading.Thread(target=_run_paypal_submit,
-                                     args=(pp_task_id, paypal_service, link, email),
-                                     daemon=True).start()
-                    row["paypal_task_id"] = pp_task_id
-                else:
-                    # No service — provide command template for local run
-                    row["paypal_command"] = _paypal_local_command(link, email)
-
+                pp_task_id = _create_task("pay-paypal",
+                                          {"email": email, "checkout_url": link})
+                threading.Thread(
+                    target=_run_paypal_submit,
+                    args=(pp_task_id, link, email, "DE"),
+                    daemon=True,
+                ).start()
+                row["paypal_task_id"] = pp_task_id
             results.append(row)
         else:
             results.append({"email": email, "ok": False, "error": r.get("error")})
     return {
         "results": results,
         "paypal_enabled": paypal_do,
-        "paypal_service_configured": bool(paypal_service),
     }
 
 
-def _paypal_local_command(checkout_url: str, email: str) -> str:
-    """Build a shell command the user can run locally to trigger pay_paypal.py."""
-    # Escape single quotes in case of odd URLs
-    safe_url = checkout_url.replace("'", "'\\''")
-    return (f"cd /Users/zero/Desktop/pay && "
-            f"python pay_paypal.py '{safe_url}' --email {email}")
+def _run_paypal_submit(task_id: str, checkout_url: str,
+                       email: str | None, locale: str = "DE") -> None:
+    """Run inline PayPal submission via core.pay_paypal.get_paypal_authorization_url.
 
+    Reports the PayPal authorization URL to the task log on success. The user
+    opens that URL in their browser to complete PayPal consent manually.
+    """
+    try:
+        from core.pay_paypal import get_paypal_authorization_url
+    except Exception as e:
+        _log(task_id, f"✗ import core.pay_paypal failed: {e}")
+        _finish(task_id, {"ok": False, "error": f"import: {e}"}, "error")
+        return
 
-def _run_paypal_submit(task_id: str, service_url: str,
-                       checkout_url: str, email: str | None) -> None:
-    """POST to external PayPal sidecar service, stream result back to task log."""
-    import urllib.request as _ur
-    import urllib.error as _ue
-
-    _log(task_id, f"→ Submitting to PayPal service: {service_url}")
+    _log(task_id, f"→ PayPal submit starting")
     _log(task_id, f"  checkout_url: {checkout_url[:80]}")
-    if email:
-        _log(task_id, f"  email: {email}")
+    _log(task_id, f"  email: {email}, locale: {locale}")
+
+    # Resolve proxy (PayPal flow should use same residential proxy as the
+    # account's IP geolocation, or a specific PayPal-submit proxy if set).
+    proxy = _get_proxy(None, "pay-paypal")
+    if proxy:
+        _log(task_id, f"  proxy: {_mask_proxy(proxy)}")
+
+    # hCaptcha config from env (optional)
+    captcha_cfg = None
+    if os.environ.get("YESCAPTCHA_KEY"):
+        captcha_cfg = {
+            "api_url": os.environ.get("YESCAPTCHA_URL", "https://api.yescaptcha.com"),
+            "api_key": os.environ.get("YESCAPTCHA_KEY"),
+        }
+        _log(task_id, f"  hCaptcha: yescaptcha configured")
+
+    # Billing address override (allow DE-specific config)
+    billing = None
+    billing_env = os.environ.get("PAYPAL_BILLING_ADDRESS", "").strip()
+    if billing_env:
+        try:
+            billing = json.loads(billing_env)
+            _log(task_id, f"  billing (from env): {billing.get('city','?')}, {billing.get('country','?')}")
+        except Exception as e:
+            _log(task_id, f"  ⚠️ PAYPAL_BILLING_ADDRESS parse failed: {e}")
 
     try:
-        body = json.dumps({
-            "checkout_url": checkout_url,
-            "email": email or "",
-        }).encode()
-        req = _ur.Request(service_url.rstrip("/") + "/submit",
-                          method="POST", data=body,
-                          headers={"Content-Type": "application/json"})
-        with _ur.urlopen(req, timeout=600) as resp:
-            body = json.loads(resp.read() or b"{}")
-        _log(task_id, f"← response: {json.dumps(body)[:400]}")
-        ok = bool(body.get("ok", True))
-        _finish(task_id, body, "done" if ok else "error")
-    except _ue.HTTPError as e:
-        err = e.read().decode("utf-8", "ignore")[:300]
-        _log(task_id, f"✗ HTTP {e.code}: {err}")
-        _finish(task_id, {"ok": False, "status": e.code, "error": err}, "error")
+        result = get_paypal_authorization_url(
+            checkout_url=checkout_url,
+            email=email or "",
+            billing=billing,
+            locale=locale,
+            captcha_cfg=captcha_cfg,
+            proxy=proxy,
+        )
     except Exception as e:
-        _log(task_id, f"✗ {type(e).__name__}: {e}")
+        _log(task_id, f"✗ exception: {type(e).__name__}: {e}")
         _finish(task_id, {"ok": False, "error": str(e)}, "error")
+        return
+
+    if result.get("ok"):
+        _log(task_id, f"✅ got PayPal URL")
+        _log(task_id, f"   {result['paypal_url']}")
+        _log(task_id, f"   (open in browser, log in to PayPal, click Agree)")
+        _finish(task_id, result, "done")
+    else:
+        _log(task_id, f"✗ [stage={result.get('stage','?')}] {result.get('error','')[:200]}")
+        _finish(task_id, result, "error")
 
 
 @app.post("/api/pay-paypal")
 async def api_pay_paypal(req: PayPalSubmitReq):
-    """Submit an existing checkout URL through the PayPal sidecar service.
+    """Submit an existing Stripe checkout URL through the PayPal flow and
+    return the PayPal authorization URL via a task.
 
-    If PAYPAL_SERVICE_URL is not set, returns a shell command the user can
-    run locally (pay_paypal.py) instead.
+    The user opens the returned URL in their browser to complete PayPal
+    consent; Stripe marks the session succeeded automatically after that.
     """
-    service_url = os.environ.get("PAYPAL_SERVICE_URL", "").strip()
-    if not service_url:
-        return {
-            "ok": False,
-            "configured": False,
-            "command": _paypal_local_command(req.checkout_url, req.email or ""),
-            "hint": "Set PAYPAL_SERVICE_URL env var to enable server-side submission",
-        }
     task_id = _create_task("pay-paypal", req.model_dump())
-    threading.Thread(target=_run_paypal_submit,
-                     args=(task_id, service_url, req.checkout_url, req.email),
-                     daemon=True).start()
-    return {"ok": True, "configured": True, "task_id": task_id}
+    # Derive locale from request.mode isn't meaningful — always DE for now
+    # (PayPal-EUR flow). Could extend to accept locale param.
+    threading.Thread(
+        target=_run_paypal_submit,
+        args=(task_id, req.checkout_url, req.email, "DE"),
+        daemon=True,
+    ).start()
+    return {"ok": True, "task_id": task_id}
 
 
 @app.post("/api/subscribe-flow/bulk")
