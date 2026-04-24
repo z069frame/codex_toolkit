@@ -592,14 +592,31 @@ def _oauth_multi_one(cpa_admin: CPAMgmt, email: str, password: str,
 
         log_fn(f"  ✅ {tag}: callback ok")
 
-        auth = cpa_admin.find_auth_by_email(email)
+        # CPA's oauth_callback returns OK before the new auth file is fully
+        # visible in /v0/management/auth-files (race window, typically <1s).
+        # Poll find_auth_by_email with small backoff so we reliably catch
+        # the newly-created file and apply priority/websockets.
+        import time as _time
+        auth = None
+        for attempt in range(6):
+            auth = cpa_admin.find_auth_by_email(email)
+            if auth:
+                if attempt > 0:
+                    log_fn(f"     (found auth after {attempt} retries)")
+                break
+            _time.sleep(0.5 * (attempt + 1))  # 0.5, 1.0, 1.5, 2.0, 2.5s — total ~7.5s max
         dm_written = False
         if auth:
             auth_id = auth.get("id")
             # Auto-configure: priority=100 + websockets=on for new team auths
-            cpa_admin.set_priority(auth_id, 100)
+            pri_ok = cpa_admin.set_priority(auth_id, 100)
             ws_ok = cpa_admin.set_websockets(auth_id, True)
-            log_fn(f"     auth_id={auth_id} priority=100, websockets={'on' if ws_ok else 'set-failed'}")
+            log_fn(f"     auth_id={auth_id} "
+                   f"priority={'100' if pri_ok else 'SET-FAILED'}, "
+                   f"websockets={'on' if ws_ok else 'set-failed'}")
+        else:
+            log_fn(f"     ⚠️ auth file not found in CPA list after 7.5s — "
+                   f"priority/websockets NOT set; DM writeback skipped")
 
         # DM writeback for this specific workspace
         if writeback and auth and dm:
