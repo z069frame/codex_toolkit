@@ -1057,13 +1057,46 @@ def _find_setup_intent(data: dict) -> dict | None:
 # Public entry
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DE_BILLING = {
-    "line1": "Unter den Linden 77",
-    "city": "Berlin",
-    "state": "Berlin",
-    "postal_code": "10117",
-    "country": "DE",
+# Default billing profiles per locale. Sourced from /Users/zero/Desktop/pay/
+# config_paypal.json's alt addresses (real lookups — not random, but not
+# tied to a real human either, which is what PayPal's fraud heuristics
+# prefer for new bindings).
+_DEFAULT_BILLING_BY_LOCALE = {
+    "US": {
+        # Stockbridge, MI (small-town zip, no state attribution issue)
+        "line1": "3772 Stillson Road",
+        "city": "Stockbridge",
+        "state": "Michigan",
+        "postal_code": "49285",
+        "country": "US",
+    },
+    "SG": {
+        # Marina Bay Sands area — neutral commercial zone
+        "line1": "10 Bayfront Avenue",
+        "city": "Singapore",
+        "state": "",
+        "postal_code": "018956",
+        "country": "SG",
+    },
+    "DE": {
+        "line1": "Unter den Linden 77",
+        "city": "Berlin",
+        "state": "Berlin",
+        "postal_code": "10117",
+        "country": "DE",
+    },
+    "AU": {
+        "line1": "1 Macquarie Place",
+        "city": "Sydney",
+        "state": "New South Wales",
+        "postal_code": "2000",
+        "country": "AU",
+    },
 }
+
+# Legacy alias — kept for anyone still importing it
+_DEFAULT_DE_BILLING = _DEFAULT_BILLING_BY_LOCALE["DE"]
+
 
 _FIRST_NAMES = ["JAMES","JOHN","ROBERT","MICHAEL","WILLIAM","DAVID","RICHARD","JOSEPH",
                 "THOMAS","DANIEL","MATTHEW","MARK","MARY","PATRICIA","JENNIFER","LINDA",
@@ -1077,7 +1110,7 @@ def get_paypal_authorization_url(
     checkout_url: str,
     email: str,
     billing: dict | None = None,
-    locale: str = "DE",
+    locale: str = "US",
     captcha_cfg: dict | None = None,
     proxy: str | None = None,
     name: str | None = None,
@@ -1110,15 +1143,18 @@ def get_paypal_authorization_url(
         {"ok": False, "error": "...", "stage": "..."}
     """
     try:
-        # Normalize billing profile
-        addr = dict(billing or _DEFAULT_DE_BILLING)
-        addr.setdefault("country", locale.upper())
+        # Pick locale + billing. If caller didn't supply billing, look up the
+        # default address for this locale (falls back to US).
+        locale_key = (locale or "US").upper()
+        default_billing = _DEFAULT_BILLING_BY_LOCALE.get(
+            locale_key, _DEFAULT_BILLING_BY_LOCALE["US"])
+        addr = dict(billing or default_billing)
+        addr.setdefault("country", locale_key)
         # Randomize line1 leading digits (anti-fingerprint habit from pay.py)
         line1 = addr.get("line1", "") or ""
         if line1 and re.match(r"^\d+", line1):
             addr["line1"] = re.sub(r"^\d+", str(random.randint(100, 999)), line1)
 
-        locale_key = (locale or addr.get("country", "DE")).upper()
         locale_profile = LOCALE_PROFILES.get(locale_key, LOCALE_PROFILES["US"])
 
         card = {

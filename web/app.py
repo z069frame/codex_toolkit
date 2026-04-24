@@ -326,15 +326,18 @@ class PayReq(BaseModel):
 
 
 class PayPalSubmitReq(BaseModel):
-    """Trigger a PayPal binding on a generated Stripe checkout URL.
+    """Trigger PayPal binding on a Stripe checkout URL.
 
-    Requires a sidecar PayPal service (e.g. running pay_paypal.py) at
-    PAYPAL_SERVICE_URL env. The sidecar must expose POST /submit accepting
-    {checkout_url, email?} and return {ok, paypal_url?, session_status?, error?}.
+    Runs inline on the server (no sidecar) via core.pay_paypal. Returns a
+    task_id; the task log contains the PayPal authorization URL which the
+    user opens manually in their browser.
+
+    `locale` controls the billing profile + Stripe locale — must match the
+    country of the original pay link (use US / SG / DE / AU).
     """
     checkout_url: str
     email: Optional[str] = None
-    mode: str = "manual"  # "manual" | "playwright"
+    locale: str = "US"  # US | SG | DE | AU
 
 
 class BulkSubscribeReq(BaseModel):
@@ -2100,14 +2103,17 @@ async def api_pay(req: PayReq):
                 if tc != "team" and c.get("id"):
                     dm.patch_account(c["id"], {"token_context": "unknown"})
 
-    # Auto-submit via PayPal: country must be DE (PayPal-EUR billing flow).
-    paypal_do = req.paypal_submit and req.country.upper() == "DE"
+    # Auto-submit via PayPal. Supported checkout-side countries (must have a
+    # matching billing profile + locale in core.pay_paypal):
+    _PAYPAL_OK_COUNTRIES = {"US", "SG", "DE", "AU"}
+    country_uc = req.country.upper()
+    paypal_do = req.paypal_submit and country_uc in _PAYPAL_OK_COUNTRIES
 
     results = []
     for acc in accounts:
         r = _gen_pay(access_token=acc.get("access_token", ""),
                      plan=req.plan, ui_mode=req.ui_mode,
-                     country=req.country.upper(), currency=currency,
+                     country=country_uc, currency=currency,
                      seat_quantity=req.seat_quantity, proxy=proxy)
         email = acc.get("email", "?")
         if r.get("ok"):
@@ -2120,14 +2126,17 @@ async def api_pay(req: PayReq):
                    "workspace": r.get("workspace_name"),
                    "plan": r.get("plan"), "ui_mode": r.get("ui_mode")}
 
-            # Kick off inline PayPal submission in a background thread so
-            # the /api/pay response doesn't block for 30+s per account.
+            # Kick off inline PayPal submission with the SAME country used
+            # on the checkout side — locale + billing profile must match or
+            # Stripe rejects the address update.
             if paypal_do:
-                pp_task_id = _create_task("pay-paypal",
-                                          {"email": email, "checkout_url": link})
+                pp_task_id = _create_task("pay-paypal", {
+                    "email": email, "checkout_url": link,
+                    "locale": country_uc,
+                })
                 threading.Thread(
                     target=_run_paypal_submit,
-                    args=(pp_task_id, link, email, "DE"),
+                    args=(pp_task_id, link, email, country_uc),
                     daemon=True,
                 ).start()
                 row["paypal_task_id"] = pp_task_id
@@ -2137,6 +2146,7 @@ async def api_pay(req: PayReq):
     return {
         "results": results,
         "paypal_enabled": paypal_do,
+        "paypal_locale": country_uc if paypal_do else None,
     }
 
 
@@ -2236,12 +2246,13 @@ async def api_pay_paypal(req: PayPalSubmitReq):
     The user opens the returned URL in their browser to complete PayPal
     consent; Stripe marks the session succeeded automatically after that.
     """
+    locale = (req.locale or "US").upper()
+    if locale not in ("US", "SG", "DE", "AU"):
+        raise HTTPException(400, f"unsupported locale: {locale}")
     task_id = _create_task("pay-paypal", req.model_dump())
-    # Derive locale from request.mode isn't meaningful — always DE for now
-    # (PayPal-EUR flow). Could extend to accept locale param.
     threading.Thread(
         target=_run_paypal_submit,
-        args=(task_id, req.checkout_url, req.email, "DE"),
+        args=(task_id, req.checkout_url, req.email, locale),
         daemon=True,
     ).start()
     return {"ok": True, "task_id": task_id}

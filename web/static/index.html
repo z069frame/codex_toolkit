@@ -801,13 +801,13 @@
       <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
         Generate ChatGPT checkout link. Leave email blank to auto-pick an unsubscribed account with valid AT.
         Use <b>Redirect (old)</b> for standalone Stripe URLs (no login needed).
-        Check <b>🅿️ PayPal submit</b> (DE only) — the server runs the Stripe Checkout flow and returns a PayPal authorization URL; you open that URL manually to log in + approve.
+        Check <b>🅿️ PayPal submit</b> (US / SG / DE / AU) — the server runs the Stripe Checkout flow and returns a PayPal authorization URL; you open that URL manually to log in + approve.
       </p>
       <p style="color:var(--text-dim); font-size:0.8rem; margin-bottom:12px; padding:6px 10px; background:var(--bg); border-left:3px solid var(--primary); border-radius:4px">
-        💡 New/old URL use the same submission logic (both resolve to the same <code>cs_live_...</code> session).
-        <b>PayPal submit goes DIRECT by default</b> — ProxySeller residential is blocked by Stripe Radar, so the backend uses Railway's own IP for api.stripe.com calls.
+        💡 <b>US is the recommended locale</b> (most Stripe-friendly). SG / DE / AU also supported with matching billing profiles.
+        New/old URL use the same submission logic. PayPal submit goes <b>DIRECT by default</b> — ProxySeller (residential) is blocked by Stripe Radar, so the backend uses Railway's own IP for api.stripe.com calls.
         The PayPal auth page is opened in your own browser, not proxied.
-        To force a specific proxy for PayPal-only submission, set <code>PAYPAL_PROXY=http://...</code> env var (ignored for other features).
+        Override proxy for PayPal only via env var: <code>PAYPAL_PROXY=http://...</code>.
       </p>
       <div class="form-row">
         <div class="form-group"><label>Plan</label>
@@ -1392,20 +1392,21 @@ function onPayPlanChange() {
   if (seatsGroup) seatsGroup.style.display = (plan === 'team') ? '' : 'none';
 }
 
+const _PAYPAL_COUNTRIES = new Set(['US', 'SG', 'DE', 'AU']);
+
 function onPayCountryChange() {
-  // PayPal auto-submit only available when country=DE
   const c = document.getElementById('pay-country').value;
   const chk = document.getElementById('pay-paypal');
   const lbl = document.getElementById('pay-paypal-lbl');
-  if (c === 'DE') {
+  if (_PAYPAL_COUNTRIES.has(c)) {
     chk.disabled = false;
     lbl.style.color = 'var(--text)';
-    lbl.title = 'Auto-submit each generated link through PayPal sidecar service';
+    lbl.title = `Auto-submit via PayPal using ${c} billing profile (US suggested — Stripe-friendliest)`;
   } else {
     chk.disabled = true;
     chk.checked = false;
     lbl.style.color = 'var(--text-dim)';
-    lbl.title = 'Only available for country=DE';
+    lbl.title = 'Available for US / SG / DE / AU only (each needs a matching billing profile)';
   }
 }
 
@@ -1567,17 +1568,27 @@ async function bulkSubscribe() {
   } catch(e) { s.textContent = 'Failed: ' + e.message; }
 }
 
+// Use the country selected at generation time as the PayPal locale.
+// If the user switched the dropdown since, the current value is fine — the
+// billing profile just needs to match *something* PayPal accepts; but US is
+// the most Stripe-friendly default.
+function _currentPayPalLocale() {
+  const c = document.getElementById('pay-country').value;
+  return _PAYPAL_COUNTRIES.has(c) ? c : 'US';
+}
+
 async function payPalOne(idx) {
   const r = _payLastResults[idx];
   if (!r || !r.ok) return;
+  const locale = _currentPayPalLocale();
   const resp = await fetch(API + '/api/pay-paypal', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({checkout_url: r.link, email: r.email, mode: 'manual'}),
+    body: JSON.stringify({checkout_url: r.link, email: r.email, locale}),
   });
   const data = await resp.json();
   const s = document.getElementById('pay-bulk-status');
   if (data.task_id) {
-    s.innerHTML = `🅿️ <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">paypal task ${data.task_id.substring(0,8)}</a> — check Tasks tab for the PayPal auth URL`;
+    s.innerHTML = `🅿️ <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">paypal task ${data.task_id.substring(0,8)}</a> (locale=${locale}) — check Tasks tab for PayPal auth URL`;
   } else {
     s.textContent = 'Failed: ' + JSON.stringify(data);
   }
@@ -1586,14 +1597,15 @@ async function payPalOne(idx) {
 async function bulkPayPal() {
   const rows = _getSelectedPayRows();
   if (!rows.length) { alert('No rows selected'); return; }
+  const locale = _currentPayPalLocale();
   const s = document.getElementById('pay-bulk-status');
-  s.textContent = `Starting ${rows.length} PayPal submissions...`;
+  s.textContent = `Starting ${rows.length} PayPal submissions (locale=${locale})...`;
   const taskLinks = [];
   for (const row of rows) {
     try {
       const resp = await fetch(API + '/api/pay-paypal', {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({checkout_url: row.link, email: row.email, mode: 'manual'}),
+        body: JSON.stringify({checkout_url: row.link, email: row.email, locale}),
       });
       const data = await resp.json();
       if (data.task_id) {
@@ -1604,7 +1616,7 @@ async function bulkPayPal() {
     }
   }
   if (taskLinks.length) {
-    s.innerHTML = `🅿️ ${taskLinks.length} tasks started: ${taskLinks.join(', ')} — check Tasks for PayPal URLs`;
+    s.innerHTML = `🅿️ ${taskLinks.length} tasks started (locale=${locale}): ${taskLinks.join(', ')} — check Tasks for PayPal URLs`;
   }
 }
 
