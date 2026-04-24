@@ -800,7 +800,8 @@
       <h3>Generate Payment Link</h3>
       <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
         Generate ChatGPT checkout link. Leave email blank to auto-pick an unsubscribed account with valid AT.
-        Use <b>Redirect (old)</b> when the target browser isn't logged into ChatGPT — it returns a standalone Stripe URL that works without cookies.
+        Use <b>Redirect (old)</b> for standalone Stripe URLs (no login needed).
+        Check <b>🅿️ PayPal submit</b> (DE only) to auto-bind through PayPal via the sidecar service.
       </p>
       <div class="form-row">
         <div class="form-group"><label>Plan</label>
@@ -816,7 +817,7 @@
           </select>
         </div>
         <div class="form-group"><label>Country</label>
-          <select id="pay-country">
+          <select id="pay-country" onchange="onPayCountryChange()">
             <option value="US">US (USD)</option>
             <option value="DE">DE (EUR)</option>
             <option value="GB">GB (GBP)</option>
@@ -830,12 +831,38 @@
         <div class="form-group"><label>Email (optional)</label><input type="text" id="pay-email" placeholder="auto-pick"></div>
         <div class="form-group" id="pay-seats-group"><label>Seats (team)</label><input type="number" id="pay-seats" value="5" min="2" max="50"></div>
         <div class="form-group"><label>Count</label><input type="number" id="pay-count" value="1" min="1" max="20"></div>
+        <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
+          <input type="checkbox" id="pay-paypal" disabled>
+          <label for="pay-paypal" id="pay-paypal-lbl" style="cursor:pointer; color:var(--text-dim)" title="Only available for country=DE">🅿️ PayPal submit</label>
+        </div>
         <button class="btn btn-primary" onclick="doPay()">Generate</button>
       </div>
     </div>
     <div id="pay-result" class="card" style="display:none">
-      <h3>Results</h3>
-      <div id="pay-result-box" class="log-box"></div>
+      <h3>Results <span id="pay-result-count" class="badge"></span></h3>
+
+      <!-- Bulk action bar — only shown when there are successful results -->
+      <div id="pay-bulk-bar" style="display:none; align-items:center; gap:10px; flex-wrap:wrap; padding:8px 10px; background:var(--bg); border:1px dashed var(--border); border-radius:6px; margin-bottom:10px">
+        <label style="display:flex; align-items:center; gap:4px; margin:0">
+          <input type="checkbox" id="pay-select-all" onchange="togglePaySelectAll()"> Select all
+        </label>
+        <span style="color:var(--text-dim)">→</span>
+        <label style="margin:0">Category:
+          <select id="pay-bulk-cat" style="margin-left:4px">
+            <option value="enterprise">enterprise</option>
+            <option value="business">business</option>
+            <option value="plus">plus</option>
+          </select>
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; margin:0" title="uncheck to run Mark Paid only (skip writeback + oauth_multi)">
+          <input type="checkbox" id="pay-bulk-full" checked> Full Subscribe (Mark Paid → Writeback → OAuth Multi-WS)
+        </label>
+        <button class="btn btn-primary btn-sm" onclick="bulkSubscribe()">🔔 Subscribe selected</button>
+        <button class="btn btn-ghost btn-sm" onclick="bulkPayPal()">🅿️ PayPal submit selected</button>
+        <span id="pay-bulk-status" style="color:var(--text-dim); font-size:0.85rem"></span>
+      </div>
+
+      <div id="pay-result-box"></div>
     </div>
   </div>
 
@@ -1355,10 +1382,62 @@ function doDeactivationScan() {
 
 function onPayPlanChange() {
   const plan = document.getElementById('pay-plan').value;
-  // Seats only apply to team plan
   const seatsGroup = document.getElementById('pay-seats-group');
   if (seatsGroup) seatsGroup.style.display = (plan === 'team') ? '' : 'none';
 }
+
+function onPayCountryChange() {
+  // PayPal auto-submit only available when country=DE
+  const c = document.getElementById('pay-country').value;
+  const chk = document.getElementById('pay-paypal');
+  const lbl = document.getElementById('pay-paypal-lbl');
+  if (c === 'DE') {
+    chk.disabled = false;
+    lbl.style.color = 'var(--text)';
+    lbl.title = 'Auto-submit each generated link through PayPal sidecar service';
+  } else {
+    chk.disabled = true;
+    chk.checked = false;
+    lbl.style.color = 'var(--text-dim)';
+    lbl.title = 'Only available for country=DE';
+  }
+}
+
+function _escHTML(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+}
+
+function renderPayRow(r, idx) {
+  if (!r.ok) {
+    return `<div class="pay-row err" style="padding:6px 8px; font-family:monospace; font-size:0.85rem">❌ ${_escHTML(r.email)}: ${_escHTML(r.error)}</div>`;
+  }
+  const tag = `[${_escHTML(r.plan||'?')}/${_escHTML(r.ui_mode||'?')}]`;
+  const ws = r.workspace ? ` · ws=${_escHTML(r.workspace)}` : '';
+  const ppTask = r.paypal_task_id
+    ? `<a href="#" onclick="viewTask('${r.paypal_task_id}');return false" style="color:var(--primary)">🅿️ task ${r.paypal_task_id.substring(0,8)}</a>`
+    : (r.paypal_command
+       ? `<code style="font-size:0.75rem; color:var(--text-dim)" title="Copy + run locally">🅿️ (manual) ${_escHTML(r.paypal_command.substring(0,60))}...</code>`
+       : '');
+  return `
+    <div class="pay-row" data-email="${_escHTML(r.email)}" data-link="${_escHTML(r.link)}"
+         style="padding:8px 10px; border-bottom:1px solid var(--border); display:flex; align-items:start; gap:8px; font-size:0.85rem; font-family:monospace">
+      <input type="checkbox" class="pay-chk" checked onchange="updateBulkStatus()"
+             style="margin-top:3px; flex-shrink:0">
+      <div style="flex:1; min-width:0">
+        <div><span class="ok">✅ ${_escHTML(r.email)}</span> <span style="color:var(--text-dim)">${tag}${ws}</span></div>
+        <div style="margin-top:3px"><a href="${_escHTML(r.link)}" target="_blank" style="color:var(--primary); word-break:break-all">${_escHTML(r.link)}</a></div>
+        ${ppTask ? `<div style="margin-top:3px">${ppTask}</div>` : ''}
+      </div>
+      <div style="flex-shrink:0; display:flex; gap:4px">
+        <button class="btn btn-ghost btn-sm" onclick="subscribeOne(${idx})" title="Run subscribe-flow for this one">🔔</button>
+        <button class="btn btn-ghost btn-sm" onclick="payPalOne(${idx})" title="Submit via PayPal service">🅿️</button>
+      </div>
+    </div>
+  `;
+}
+
+// Store last results for per-row actions
+let _payLastResults = [];
 
 async function doPay() {
   const email = document.getElementById('pay-email').value.trim() || null;
@@ -1367,26 +1446,184 @@ async function doPay() {
   const plan = document.getElementById('pay-plan').value;
   const ui_mode = document.getElementById('pay-ui-mode').value;
   const seat_quantity = parseInt(document.getElementById('pay-seats').value) || 5;
+  const paypal_submit = document.getElementById('pay-paypal').checked;
   const box = document.getElementById('pay-result-box');
   const card = document.getElementById('pay-result');
+  const countBadge = document.getElementById('pay-result-count');
+  const bulkBar = document.getElementById('pay-bulk-bar');
   card.style.display = 'block';
-  box.innerHTML = 'Generating...';
+  box.innerHTML = '<div style="padding:10px">Generating...</div>';
+  bulkBar.style.display = 'none';
+  countBadge.textContent = '';
   try {
     const r = await fetch(API + '/api/pay', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({email, country, count, plan, ui_mode, seat_quantity}),
+      body: JSON.stringify({email, country, count, plan, ui_mode, seat_quantity, paypal_submit}),
     });
     const data = await r.json();
-    if (!r.ok) { box.innerHTML = '<span class="err">Error: ' + JSON.stringify(data) + '</span>'; return; }
-    box.innerHTML = (data.results || []).map(r => {
-      if (r.ok) {
-        const tag = `[${r.plan || '?'} / ${r.ui_mode || '?'}]`;
-        const ws = r.workspace ? `\n   Workspace: ${r.workspace}` : '';
-        return `<span class="ok">✅ ${r.email}</span> ${tag}\n   <a href="${r.link}" target="_blank" style="color:var(--primary)">${r.link}</a>${ws}`;
+    if (!r.ok) { box.innerHTML = '<span class="err">Error: ' + _escHTML(JSON.stringify(data)) + '</span>'; return; }
+    _payLastResults = data.results || [];
+    const okCount = _payLastResults.filter(x => x.ok).length;
+    countBadge.textContent = `${okCount}/${_payLastResults.length}`;
+    box.innerHTML = _payLastResults.map((r, i) => renderPayRow(r, i)).join('');
+    if (okCount > 0) {
+      bulkBar.style.display = 'flex';
+      updateBulkStatus();
+    }
+    if (paypal_submit && !data.paypal_service_configured && data.paypal_enabled) {
+      const note = document.createElement('div');
+      note.innerHTML = '<div style="color:var(--warning, orange); padding:8px; font-size:0.85rem">⚠️ PAYPAL_SERVICE_URL not set on server — per-row shell commands shown below can be run locally instead</div>';
+      box.prepend(note);
+    }
+  } catch(e) { box.innerHTML = '<span class="err">Failed: ' + _escHTML(e.message) + '</span>'; }
+}
+
+function togglePaySelectAll() {
+  const on = document.getElementById('pay-select-all').checked;
+  document.querySelectorAll('#pay-result-box .pay-chk').forEach(c => c.checked = on);
+  updateBulkStatus();
+}
+
+function updateBulkStatus() {
+  const n = document.querySelectorAll('#pay-result-box .pay-chk:checked').length;
+  const total = document.querySelectorAll('#pay-result-box .pay-chk').length;
+  const el = document.getElementById('pay-bulk-status');
+  if (el) el.textContent = total ? `${n}/${total} selected` : '';
+  const allBox = document.getElementById('pay-select-all');
+  if (allBox) allBox.checked = n === total && total > 0;
+}
+
+function _getSelectedPayRows() {
+  const rows = document.querySelectorAll('#pay-result-box .pay-row');
+  const selected = [];
+  rows.forEach(row => {
+    const chk = row.querySelector('.pay-chk');
+    if (chk && chk.checked) {
+      selected.push({
+        email: row.dataset.email,
+        link: row.dataset.link,
+      });
+    }
+  });
+  return selected;
+}
+
+async function subscribeOne(idx) {
+  const r = _payLastResults[idx];
+  if (!r || !r.ok) return;
+  const cat = document.getElementById('pay-bulk-cat').value;
+  const full = document.getElementById('pay-bulk-full').checked;
+  const body = {
+    target: r.email,
+    category: cat,
+    do_mark_paid: true,
+    do_writeback: full,
+    do_oauth_multi: full,
+    dm_writeback: full,
+  };
+  const resp = await fetch(API + '/api/subscribe-flow', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json();
+  if (data.task_id) {
+    const s = document.getElementById('pay-bulk-status');
+    if (s) s.innerHTML = `🔔 <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">subscribe task ${data.task_id.substring(0,8)}</a>`;
+  } else {
+    alert('Subscribe start failed: ' + JSON.stringify(data));
+  }
+}
+
+async function bulkSubscribe() {
+  const rows = _getSelectedPayRows();
+  if (!rows.length) { alert('No rows selected'); return; }
+  const cat = document.getElementById('pay-bulk-cat').value;
+  const full = document.getElementById('pay-bulk-full').checked;
+  const s = document.getElementById('pay-bulk-status');
+  s.textContent = `Starting ${rows.length} subscribe tasks...`;
+  const body = {
+    targets: rows.map(r => r.email),
+    category: cat,
+    do_mark_paid: true,
+    do_writeback: full,
+    do_oauth_multi: full,
+    dm_writeback: full,
+  };
+  try {
+    const resp = await fetch(API + '/api/subscribe-flow/bulk', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (data.tasks) {
+      const links = data.tasks.map(t =>
+        `<a href="#" onclick="viewTask('${t.task_id}');return false" style="color:var(--primary)">${t.target.substring(0,20)}</a>`
+      ).join(', ');
+      s.innerHTML = `🔔 ${data.tasks.length} tasks: ${links}`;
+    } else {
+      s.textContent = 'Failed: ' + JSON.stringify(data);
+    }
+  } catch(e) { s.textContent = 'Failed: ' + e.message; }
+}
+
+async function payPalOne(idx) {
+  const r = _payLastResults[idx];
+  if (!r || !r.ok) return;
+  const resp = await fetch(API + '/api/pay-paypal', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({checkout_url: r.link, email: r.email, mode: 'manual'}),
+  });
+  const data = await resp.json();
+  const s = document.getElementById('pay-bulk-status');
+  if (!data.configured) {
+    s.innerHTML = `⚠️ PAYPAL_SERVICE_URL not configured. Command:`;
+    const pre = document.createElement('pre');
+    pre.style.cssText = 'background:var(--bg); padding:8px; border-radius:4px; font-size:0.75rem; margin-top:4px; user-select:all';
+    pre.textContent = data.command || '(no command)';
+    s.appendChild(pre);
+  } else if (data.task_id) {
+    s.innerHTML = `🅿️ <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">paypal task ${data.task_id.substring(0,8)}</a>`;
+  }
+}
+
+async function bulkPayPal() {
+  const rows = _getSelectedPayRows();
+  if (!rows.length) { alert('No rows selected'); return; }
+  const s = document.getElementById('pay-bulk-status');
+  s.textContent = `Starting ${rows.length} PayPal submissions...`;
+  const taskLinks = [];
+  let commandList = [];
+  for (const row of rows) {
+    try {
+      const resp = await fetch(API + '/api/pay-paypal', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({checkout_url: row.link, email: row.email, mode: 'manual'}),
+      });
+      const data = await resp.json();
+      if (data.task_id) {
+        taskLinks.push(`<a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">${row.email.substring(0,15)}</a>`);
+      } else if (data.command) {
+        commandList.push(data.command);
       }
-      return `<span class="err">❌ ${r.email}: ${r.error}</span>`;
-    }).join('\n\n');
-  } catch(e) { box.innerHTML = '<span class="err">Failed: ' + e.message + '</span>'; }
+    } catch(e) {
+      taskLinks.push(`<span style="color:red">${row.email}: ${e.message}</span>`);
+    }
+  }
+  if (commandList.length) {
+    s.innerHTML = `⚠️ PayPal service not configured. Run locally:<pre style="background:var(--bg); padding:8px; border-radius:4px; font-size:0.75rem; margin-top:4px; user-select:all">${commandList.join('\n')}</pre>`;
+  } else if (taskLinks.length) {
+    s.innerHTML = `🅿️ Tasks: ${taskLinks.join(', ')}`;
+  }
+}
+
+function viewTask(tid) {
+  // Switch to Tasks tab by simulating click
+  const tab = document.querySelector('.tab[data-tab="tasks"]');
+  if (tab) tab.click();
+  // Delay so tab is active, then focus the specific task if loadTaskDetail exists
+  setTimeout(() => {
+    if (typeof loadTaskDetail === 'function') loadTaskDetail(tid);
+  }, 100);
 }
 
 // ── Task Proxy ──

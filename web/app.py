@@ -322,6 +322,31 @@ class PayReq(BaseModel):
     plan: str = "team"          # "team" | "plus"
     ui_mode: str = "custom"     # "custom" (new) | "redirect" (old)
     seat_quantity: int = 5      # team only
+    paypal_submit: bool = False # if True + country=DE → auto-submit via PayPal service
+
+
+class PayPalSubmitReq(BaseModel):
+    """Trigger a PayPal binding on a generated Stripe checkout URL.
+
+    Requires a sidecar PayPal service (e.g. running pay_paypal.py) at
+    PAYPAL_SERVICE_URL env. The sidecar must expose POST /submit accepting
+    {checkout_url, email?} and return {ok, paypal_url?, session_status?, error?}.
+    """
+    checkout_url: str
+    email: Optional[str] = None
+    mode: str = "manual"  # "manual" | "playwright"
+
+
+class BulkSubscribeReq(BaseModel):
+    """Run subscribe-flow on multiple targets in parallel."""
+    targets: list[str]  # emails, payment links, or ATs
+    category: str = "enterprise"
+    do_mark_paid: bool = True
+    do_writeback: bool = True
+    do_oauth_multi: bool = True
+    dm_writeback: bool = True
+    seats: int = 9
+    proxy: Optional[str] = None
 
 
 class MarkPaidReq(BaseModel):
@@ -2075,6 +2100,10 @@ async def api_pay(req: PayReq):
                 if tc != "team" and c.get("id"):
                     dm.patch_account(c["id"], {"token_context": "unknown"})
 
+    # Auto-submit via PayPal service: country must be DE (PayPal-EUR flow).
+    paypal_do = req.paypal_submit and req.country.upper() == "DE"
+    paypal_service = os.environ.get("PAYPAL_SERVICE_URL", "").strip()
+
     results = []
     for acc in accounts:
         r = _gen_pay(access_token=acc.get("access_token", ""),
@@ -2083,16 +2112,122 @@ async def api_pay(req: PayReq):
                      seat_quantity=req.seat_quantity, proxy=proxy)
         email = acc.get("email", "?")
         if r.get("ok"):
+            link = r["payment_link"]
             # Only persist the link for team plan (plus is one-off, no seats).
             if acc.get("id") and req.plan == "team":
-                dm.patch_account(acc["id"], {"payment_link": r["payment_link"],
+                dm.patch_account(acc["id"], {"payment_link": link,
                                              "subscription_status": "pending_payment"})
-            results.append({"email": email, "ok": True, "link": r["payment_link"],
-                           "workspace": r.get("workspace_name"),
-                           "plan": r.get("plan"), "ui_mode": r.get("ui_mode")})
+            row = {"email": email, "ok": True, "link": link,
+                   "workspace": r.get("workspace_name"),
+                   "plan": r.get("plan"), "ui_mode": r.get("ui_mode")}
+
+            # Kick off PayPal submit asynchronously if enabled + DE + service configured
+            if paypal_do:
+                if paypal_service:
+                    pp_task_id = _create_task("pay-paypal",
+                                               {"email": email, "checkout_url": link})
+                    threading.Thread(target=_run_paypal_submit,
+                                     args=(pp_task_id, paypal_service, link, email),
+                                     daemon=True).start()
+                    row["paypal_task_id"] = pp_task_id
+                else:
+                    # No service — provide command template for local run
+                    row["paypal_command"] = _paypal_local_command(link, email)
+
+            results.append(row)
         else:
             results.append({"email": email, "ok": False, "error": r.get("error")})
-    return {"results": results}
+    return {
+        "results": results,
+        "paypal_enabled": paypal_do,
+        "paypal_service_configured": bool(paypal_service),
+    }
+
+
+def _paypal_local_command(checkout_url: str, email: str) -> str:
+    """Build a shell command the user can run locally to trigger pay_paypal.py."""
+    # Escape single quotes in case of odd URLs
+    safe_url = checkout_url.replace("'", "'\\''")
+    return (f"cd /Users/zero/Desktop/pay && "
+            f"python pay_paypal.py '{safe_url}' --email {email}")
+
+
+def _run_paypal_submit(task_id: str, service_url: str,
+                       checkout_url: str, email: str | None) -> None:
+    """POST to external PayPal sidecar service, stream result back to task log."""
+    import urllib.request as _ur
+    import urllib.error as _ue
+
+    _log(task_id, f"→ Submitting to PayPal service: {service_url}")
+    _log(task_id, f"  checkout_url: {checkout_url[:80]}")
+    if email:
+        _log(task_id, f"  email: {email}")
+
+    try:
+        body = json.dumps({
+            "checkout_url": checkout_url,
+            "email": email or "",
+        }).encode()
+        req = _ur.Request(service_url.rstrip("/") + "/submit",
+                          method="POST", data=body,
+                          headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=600) as resp:
+            body = json.loads(resp.read() or b"{}")
+        _log(task_id, f"← response: {json.dumps(body)[:400]}")
+        ok = bool(body.get("ok", True))
+        _finish(task_id, body, "done" if ok else "error")
+    except _ue.HTTPError as e:
+        err = e.read().decode("utf-8", "ignore")[:300]
+        _log(task_id, f"✗ HTTP {e.code}: {err}")
+        _finish(task_id, {"ok": False, "status": e.code, "error": err}, "error")
+    except Exception as e:
+        _log(task_id, f"✗ {type(e).__name__}: {e}")
+        _finish(task_id, {"ok": False, "error": str(e)}, "error")
+
+
+@app.post("/api/pay-paypal")
+async def api_pay_paypal(req: PayPalSubmitReq):
+    """Submit an existing checkout URL through the PayPal sidecar service.
+
+    If PAYPAL_SERVICE_URL is not set, returns a shell command the user can
+    run locally (pay_paypal.py) instead.
+    """
+    service_url = os.environ.get("PAYPAL_SERVICE_URL", "").strip()
+    if not service_url:
+        return {
+            "ok": False,
+            "configured": False,
+            "command": _paypal_local_command(req.checkout_url, req.email or ""),
+            "hint": "Set PAYPAL_SERVICE_URL env var to enable server-side submission",
+        }
+    task_id = _create_task("pay-paypal", req.model_dump())
+    threading.Thread(target=_run_paypal_submit,
+                     args=(task_id, service_url, req.checkout_url, req.email),
+                     daemon=True).start()
+    return {"ok": True, "configured": True, "task_id": task_id}
+
+
+@app.post("/api/subscribe-flow/bulk")
+async def api_subscribe_flow_bulk(req: BulkSubscribeReq):
+    """Fan out subscribe-flow across multiple targets, returning a list of task IDs."""
+    tasks_out = []
+    for t in req.targets:
+        t = (t or "").strip()
+        if not t:
+            continue
+        sub_req = SubscribeFlowReq(
+            target=t, category=req.category,
+            do_mark_paid=req.do_mark_paid,
+            do_writeback=req.do_writeback,
+            do_oauth_multi=req.do_oauth_multi,
+            dm_writeback=req.dm_writeback,
+            seats=req.seats, proxy=req.proxy,
+        )
+        task_id = _create_task("subscribe-flow", sub_req.model_dump())
+        threading.Thread(target=_run_subscribe_flow,
+                         args=(task_id, sub_req), daemon=True).start()
+        tasks_out.append({"target": t, "task_id": task_id})
+    return {"ok": True, "tasks": tasks_out}
 
 
 @app.post("/api/mark-paid")
