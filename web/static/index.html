@@ -263,6 +263,8 @@
   }
   .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 8px; }
+  @keyframes spin { from{transform:rotate(0)} to{transform:rotate(360deg)} }
+  .pp-spinner { display:inline-block; animation: spin 1.5s linear infinite; }
   .btn-green {
     background: var(--color-success);
     color: #ffffff;
@@ -1434,31 +1436,130 @@ function _escHTML(s) {
 
 function renderPayRow(r, idx) {
   if (!r.ok) {
-    return `<div class="pay-row err" style="padding:6px 8px; font-family:monospace; font-size:0.85rem">❌ ${_escHTML(r.email)}: ${_escHTML(r.error)}</div>`;
+    return `<div class="pay-row err" style="padding:8px 10px; border-bottom:1px solid var(--border); font-family:monospace; font-size:0.85rem"><span class="err">❌ ${_escHTML(r.email)}</span>: ${_escHTML(r.error)}</div>`;
   }
-  const tag = `[${_escHTML(r.plan||'?')}/${_escHTML(r.ui_mode||'?')}]`;
-  const ws = r.workspace ? ` · ws=${_escHTML(r.workspace)}` : '';
-  const ppTask = r.paypal_task_id
-    ? `<a href="#" onclick="viewTask('${r.paypal_task_id}');return false" style="color:var(--primary)">🅿️ task ${r.paypal_task_id.substring(0,8)}</a>`
-    : (r.paypal_command
-       ? `<code style="font-size:0.75rem; color:var(--text-dim)" title="Copy + run locally">🅿️ (manual) ${_escHTML(r.paypal_command.substring(0,60))}...</code>`
-       : '');
+  const tag = `<span style="color:var(--text-dim); font-size:0.78rem">[${_escHTML(r.plan||'?')}/${_escHTML(r.ui_mode||'?')}]</span>`;
+  const ws = r.workspace ? `<span style="color:var(--text-dim); font-size:0.78rem"> · ${_escHTML(r.workspace)}</span>` : '';
+
+  // PayPal section — renders inline. Initial state shows "submitting..." if a
+  // task was started, which pollPayPalTask() will later replace with the
+  // clickable PayPal consent URL.
+  let ppSection = '';
+  if (r.paypal_task_id) {
+    ppSection = `
+      <div class="pay-paypal-section" data-pp-task="${r.paypal_task_id}" style="margin-top:4px; padding:6px 8px; background:rgba(102,72,196,0.06); border-left:2px solid #6648c4; border-radius:0 4px 4px 0">
+        <span style="color:#6648c4; font-weight:600">🅿️ PayPal</span>
+        <span class="pp-status" style="color:var(--text-dim); font-size:0.8rem; margin-left:6px">
+          <span class="pp-spinner" style="display:inline-block; animation:spin 1s linear infinite">⏳</span> submitting...
+          <a href="#" onclick="viewTask('${r.paypal_task_id}');return false" style="color:var(--text-dim); font-size:0.75rem; margin-left:6px">[task ${r.paypal_task_id.substring(0,8)}]</a>
+        </span>
+      </div>`;
+  }
+
   return `
-    <div class="pay-row" data-email="${_escHTML(r.email)}" data-link="${_escHTML(r.link)}"
-         style="padding:8px 10px; border-bottom:1px solid var(--border); display:flex; align-items:start; gap:8px; font-size:0.85rem; font-family:monospace">
-      <input type="checkbox" class="pay-chk" checked onchange="updateBulkStatus()"
-             style="margin-top:3px; flex-shrink:0">
-      <div style="flex:1; min-width:0">
-        <div><span class="ok">✅ ${_escHTML(r.email)}</span> <span style="color:var(--text-dim)">${tag}${ws}</span></div>
-        <div style="margin-top:3px"><a href="${_escHTML(r.link)}" target="_blank" style="color:var(--primary); word-break:break-all">${_escHTML(r.link)}</a></div>
-        ${ppTask ? `<div style="margin-top:3px">${ppTask}</div>` : ''}
-      </div>
-      <div style="flex-shrink:0; display:flex; gap:4px">
-        <button class="btn btn-ghost btn-sm" onclick="subscribeOne(${idx})" title="Run subscribe-flow for this one">🔔</button>
-        <button class="btn btn-ghost btn-sm" onclick="payPalOne(${idx})" title="Submit via PayPal service">🅿️</button>
+    <div class="pay-row" data-email="${_escHTML(r.email)}" data-link="${_escHTML(r.link)}" data-idx="${idx}"
+         style="padding:10px 12px; border-bottom:1px solid var(--border); font-size:0.85rem; font-family:monospace">
+      <div style="display:flex; align-items:flex-start; gap:10px">
+        <input type="checkbox" class="pay-chk" checked onchange="updateBulkStatus()" style="margin-top:4px; flex-shrink:0">
+        <div style="flex:1; min-width:0">
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+            <span class="ok" style="font-weight:600">✅ ${_escHTML(r.email)}</span>
+            ${tag}${ws}
+          </div>
+          <div style="margin-top:4px">
+            <span style="color:var(--text-dim); font-size:0.78rem">🔗 Stripe:</span>
+            <a href="${_escHTML(r.link)}" target="_blank" style="color:var(--primary); word-break:break-all; margin-left:4px">${_escHTML(r.link.length > 90 ? r.link.substring(0, 90) + '…' : r.link)}</a>
+          </div>
+          ${ppSection}
+        </div>
+        <div style="flex-shrink:0; display:flex; flex-direction:column; gap:4px; min-width:130px">
+          <button class="btn btn-primary btn-sm" onclick="subscribeOne(${idx})" title="Mark subscribed (mark_paid → writeback → oauth_multi)">🔔 Mark Subscribed</button>
+          <button class="btn btn-ghost btn-sm" onclick="payPalOne(${idx})" title="${r.paypal_task_id ? 'Re-submit via PayPal' : 'Submit via PayPal to get authorization URL'}">🅿️ ${r.paypal_task_id ? 'Re-submit' : 'PayPal'}</button>
+        </div>
       </div>
     </div>
   `;
+}
+
+// Poll a pay-paypal task's status. When done, update the corresponding row
+// in the UI to show the clickable PayPal authorization URL.
+async function pollPayPalTask(taskId, rowEl) {
+  if (!rowEl) return;
+  const section = rowEl.querySelector('.pay-paypal-section');
+  const statusEl = section && section.querySelector('.pp-status');
+  if (!statusEl) return;
+
+  const start = Date.now();
+  const TIMEOUT_MS = 120000; // 2 min
+  while (Date.now() - start < TIMEOUT_MS) {
+    try {
+      const r = await fetch(API + `/api/tasks/${taskId}`);
+      if (r.ok) {
+        const t = await r.json();
+        if (t.status === 'done' || t.status === 'error') {
+          const result = t.result || {};
+          if (result.ok && result.paypal_url) {
+            const url = result.paypal_url;
+            statusEl.innerHTML = `
+              <a href="${_escHTML(url)}" target="_blank" class="btn btn-primary btn-sm" style="text-decoration:none; font-size:0.78rem; padding:4px 10px; margin-left:4px">🅿️ Open PayPal →</a>
+              <span style="color:var(--text-dim); font-size:0.72rem; margin-left:6px">after Agree, click 🔔 Mark Subscribed</span>
+              <a href="#" onclick="viewTask('${taskId}');return false" style="color:var(--text-dim); font-size:0.7rem; margin-left:6px">[task]</a>
+            `;
+          } else {
+            const err = (result.error || 'failed').substring(0, 150);
+            statusEl.innerHTML = `
+              <span class="err" style="font-size:0.78rem">❌ ${_escHTML(err)}</span>
+              <a href="#" onclick="viewTask('${taskId}');return false" style="color:var(--primary); font-size:0.75rem; margin-left:6px">[logs]</a>
+            `;
+          }
+          return;
+        }
+      }
+    } catch (e) {
+      // keep polling on transient errors
+    }
+    await new Promise(r => setTimeout(r, 2500));
+  }
+  // Timed out
+  statusEl.innerHTML = `
+    <span style="color:var(--warning, orange); font-size:0.78rem">⏱ still running after 2min</span>
+    <a href="#" onclick="viewTask('${taskId}');return false" style="color:var(--primary); font-size:0.75rem; margin-left:6px">[check task]</a>
+  `;
+}
+
+// Helper: start polling a freshly-submitted PayPal task attached to a row.
+function _startPayPalPollingOnRow(rowEl, taskId) {
+  if (!rowEl || !taskId) return;
+  // If the row doesn't have a PayPal section yet, inject one
+  let section = rowEl.querySelector('.pay-paypal-section');
+  if (!section) {
+    const injectPoint = rowEl.querySelector('[data-link]')
+      ? rowEl.querySelector('[data-link]').parentElement  // fallback
+      : rowEl.querySelector('div:nth-child(1) > div:nth-child(2)');
+    // Simpler: just append to the main content div
+    const content = rowEl.querySelector('div > div:nth-child(2)');
+    if (!content) return;
+    const html = `
+      <div class="pay-paypal-section" data-pp-task="${taskId}" style="margin-top:4px; padding:6px 8px; background:rgba(102,72,196,0.06); border-left:2px solid #6648c4; border-radius:0 4px 4px 0">
+        <span style="color:#6648c4; font-weight:600">🅿️ PayPal</span>
+        <span class="pp-status" style="color:var(--text-dim); font-size:0.8rem; margin-left:6px">
+          <span class="pp-spinner" style="display:inline-block">⏳</span> submitting...
+          <a href="#" onclick="viewTask('${taskId}');return false" style="color:var(--text-dim); font-size:0.75rem; margin-left:6px">[task ${taskId.substring(0,8)}]</a>
+        </span>
+      </div>`;
+    content.insertAdjacentHTML('beforeend', html);
+  } else {
+    // reset section to submitting state
+    section.dataset.ppTask = taskId;
+    const statusEl = section.querySelector('.pp-status');
+    if (statusEl) {
+      statusEl.innerHTML = `
+        <span class="pp-spinner" style="display:inline-block">⏳</span> submitting...
+        <a href="#" onclick="viewTask('${taskId}');return false" style="color:var(--text-dim); font-size:0.75rem; margin-left:6px">[task ${taskId.substring(0,8)}]</a>
+      `;
+    }
+  }
+  pollPayPalTask(taskId, rowEl);
 }
 
 // Store last results for per-row actions
@@ -1496,6 +1597,14 @@ async function doPay() {
       bulkBar.style.display = 'flex';
       updateBulkStatus();
     }
+    // For each row that has a paypal_task_id, kick off polling to update
+    // the inline PayPal section once the task completes.
+    _payLastResults.forEach((r, i) => {
+      if (r.ok && r.paypal_task_id) {
+        const rowEl = box.querySelector(`.pay-row[data-idx="${i}"]`);
+        if (rowEl) pollPayPalTask(r.paypal_task_id, rowEl);
+      }
+    });
   } catch(e) { box.innerHTML = '<span class="err">Failed: ' + _escHTML(e.message) + '</span>'; }
 }
 
@@ -1598,27 +1707,36 @@ async function payPalOne(idx) {
   const r = _payLastResults[idx];
   if (!r || !r.ok) return;
   const locale = _currentPayPalLocale();
+  const rowEl = document.querySelector(`.pay-row[data-idx="${idx}"]`);
   const resp = await fetch(API + '/api/pay-paypal', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({checkout_url: r.link, email: r.email, locale}),
   });
   const data = await resp.json();
-  const s = document.getElementById('pay-bulk-status');
   if (data.task_id) {
-    s.innerHTML = `🅿️ <a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">paypal task ${data.task_id.substring(0,8)}</a> (locale=${locale}) — check Tasks tab for PayPal auth URL`;
+    // Persist task_id on the cached result so future re-renders keep it
+    _payLastResults[idx].paypal_task_id = data.task_id;
+    _startPayPalPollingOnRow(rowEl, data.task_id);
+    const s = document.getElementById('pay-bulk-status');
+    if (s) s.textContent = `🅿️ PayPal submit started for ${r.email} (locale=${locale}) — URL will appear inline below`;
   } else {
-    s.textContent = 'Failed: ' + JSON.stringify(data);
+    alert('Failed: ' + JSON.stringify(data));
   }
 }
 
 async function bulkPayPal() {
-  const rows = _getSelectedPayRows();
-  if (!rows.length) { alert('No rows selected'); return; }
+  const selected = _getSelectedPayRows();
+  if (!selected.length) { alert('No rows selected'); return; }
   const locale = _currentPayPalLocale();
   const s = document.getElementById('pay-bulk-status');
-  s.textContent = `Starting ${rows.length} PayPal submissions (locale=${locale})...`;
-  const taskLinks = [];
-  for (const row of rows) {
+  s.textContent = `Starting ${selected.length} PayPal submissions (locale=${locale})...`;
+
+  let started = 0;
+  for (const row of selected) {
+    // Find cached result + row DOM by email match
+    const idx = _payLastResults.findIndex(r => r.ok && r.email === row.email);
+    if (idx < 0) continue;
+    const rowEl = document.querySelector(`.pay-row[data-idx="${idx}"]`);
     try {
       const resp = await fetch(API + '/api/pay-paypal', {
         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -1626,15 +1744,13 @@ async function bulkPayPal() {
       });
       const data = await resp.json();
       if (data.task_id) {
-        taskLinks.push(`<a href="#" onclick="viewTask('${data.task_id}');return false" style="color:var(--primary)">${row.email.substring(0,15)}</a>`);
+        _payLastResults[idx].paypal_task_id = data.task_id;
+        _startPayPalPollingOnRow(rowEl, data.task_id);
+        started++;
       }
-    } catch(e) {
-      taskLinks.push(`<span style="color:red">${row.email}: ${e.message}</span>`);
-    }
+    } catch(e) { /* ignore per-row errors */ }
   }
-  if (taskLinks.length) {
-    s.innerHTML = `🅿️ ${taskLinks.length} tasks started (locale=${locale}): ${taskLinks.join(', ')} — check Tasks for PayPal URLs`;
-  }
+  s.innerHTML = `🅿️ ${started}/${selected.length} PayPal submissions started (locale=${locale}) — URLs will appear inline as tasks complete`;
 }
 
 function viewTask(tid) {
