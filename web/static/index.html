@@ -801,7 +801,10 @@
       <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
         Generate ChatGPT checkout link. Leave email blank to auto-pick an unsubscribed account with valid AT.
         Use <b>Redirect (old)</b> for standalone Stripe URLs (no login needed).
-        Check <b>🅿️ PayPal submit</b> (DE only) — the server will run the Stripe Checkout flow and return a PayPal authorization URL; you open that URL manually to log in + approve.
+        Check <b>🅿️ PayPal submit</b> (DE only) — the server runs the Stripe Checkout flow and returns a PayPal authorization URL; you open that URL manually to log in + approve.
+      </p>
+      <p style="color:var(--text-dim); font-size:0.8rem; margin-bottom:12px; padding:6px 10px; background:var(--bg); border-left:3px solid var(--primary); border-radius:4px">
+        💡 New / old URL uses the same submission logic (both resolve to the same <code>cs_live_...</code> session). The backend only uses a proxy for the Stripe-side submission — the <b>PayPal auth page is opened in your own browser</b>, not through a proxy. If Stripe Radar blocks a particular proxy IP, set env var <code>PAYPAL_PROXY=DIRECT</code> or override the per-task proxy for "pay-paypal".
       </p>
       <div class="form-row">
         <div class="form-group"><label>Plan</label>

@@ -2158,11 +2158,27 @@ def _run_paypal_submit(task_id: str, checkout_url: str,
     _log(task_id, f"  checkout_url: {checkout_url[:80]}")
     _log(task_id, f"  email: {email}, locale: {locale}")
 
-    # Resolve proxy (PayPal flow should use same residential proxy as the
-    # account's IP geolocation, or a specific PayPal-submit proxy if set).
-    proxy = _get_proxy(None, "pay-paypal")
-    if proxy:
-        _log(task_id, f"  proxy: {_mask_proxy(proxy)}")
+    # Resolve proxy for PayPal flow with these overrides (in priority order):
+    #   1. PAYPAL_PROXY env var — dedicated proxy for PayPal submissions
+    #      Special value "DIRECT" / "NONE" → skip proxy (use Railway's own IP)
+    #   2. per-task proxy override (set via Web UI task-proxy bar on "pay-paypal")
+    #   3. runtime proxy (PAYPAL default = ProxySeller residential)
+    # Rationale: ProxySeller rotates IPs every 5min and may be flagged by
+    # Stripe Radar for PayPal binding. Going direct from Railway is stable
+    # but a known datacenter IP — test both and pick what works.
+    pp_env = (os.environ.get("PAYPAL_PROXY") or "").strip()
+    if pp_env.upper() in ("DIRECT", "NONE"):
+        proxy = None
+        _log(task_id, f"  proxy: (direct — PAYPAL_PROXY={pp_env})")
+    elif pp_env:
+        proxy = pp_env
+        _log(task_id, f"  proxy: {_mask_proxy(proxy)} (from PAYPAL_PROXY env)")
+    else:
+        proxy = _get_proxy(None, "pay-paypal")
+        if proxy:
+            _log(task_id, f"  proxy: {_mask_proxy(proxy)} (from runtime default / task override)")
+        else:
+            _log(task_id, f"  proxy: (direct — no default proxy configured)")
 
     # hCaptcha config from env (optional)
     captcha_cfg = None
