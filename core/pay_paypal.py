@@ -1011,28 +1011,67 @@ def confirm_payment(
 
     confirm_data = resp.json()
 
-    next_action = confirm_data.get("next_action")
-    if not next_action:
-        seti = _find_setup_intent(confirm_data)
-        if seti and seti.get("next_action"):
-            next_action = seti["next_action"]
+    # Search progressively wider for the PayPal redirect URL.
+    # Stripe has multiple response shapes depending on
+    # deferred-vs-eager intent creation, Checkout vs Elements, etc.
+    def _search_redirect_url(d):
+        """Walk arbitrary dicts/lists looking for a redirect_to_url.url."""
+        if isinstance(d, dict):
+            # Direct next_action field with redirect_to_url
+            na = d.get("next_action") or {}
+            if isinstance(na, dict) and na.get("type") == "redirect_to_url":
+                rtu = na.get("redirect_to_url") or {}
+                url = rtu.get("url")
+                if url:
+                    return url, rtu.get("return_url")
+            # Also check payment_intent, setup_intent etc.
+            for k in ("payment_intent", "setup_intent",
+                      "payment_method_object", "source"):
+                nested = d.get(k)
+                if nested:
+                    found = _search_redirect_url(nested)
+                    if found:
+                        return found
+            # Fallback: generic key 'redirect_to_url' anywhere
+            rtu = d.get("redirect_to_url")
+            if isinstance(rtu, dict) and rtu.get("url"):
+                return rtu.get("url"), rtu.get("return_url")
+        return None
 
-    if next_action and next_action.get("type") == "redirect_to_url":
-        redirect_url = next_action.get("redirect_to_url", {}).get("url")
-        seti_return = next_action.get("redirect_to_url", {}).get("return_url", return_url)
-        if not redirect_url:
-            raise RuntimeError(f"redirect_to_url.url 为空: {next_action}")
+    found = _search_redirect_url(confirm_data)
+    if found:
+        redirect_url, seti_return = found
+        seti_return = seti_return or return_url
         _log(f"      PayPal 授权 URL: {redirect_url}")
         _log(f"      授权后回跳 URL: {seti_return}")
-        # Surface the URL on the returned dict so the public API can hand it
-        # back to the caller. We do NOT navigate here — the user completes
-        # PayPal authorization in their browser manually.
         confirm_data["_paypal_authorization_url"] = redirect_url
         confirm_data["_paypal_return_url"] = seti_return
-    elif next_action and next_action.get("type") == "use_stripe_sdk":
-        _log(f"      警告: PayPal 流程返回 use_stripe_sdk (非预期): {next_action}")
-    elif next_action:
-        _log(f"      未识别的 next_action.type={next_action.get('type')}: {next_action}")
+    else:
+        # Dump a compact diagnostic so we know WHY Stripe returned no URL.
+        # Log enough of the confirm response to reverse-engineer the shape.
+        state = confirm_data.get("state")
+        pm_status = confirm_data.get("payment_object_status")
+        seti = confirm_data.get("setup_intent") or {}
+        pi = confirm_data.get("payment_intent") or {}
+        err_block = (confirm_data.get("error")
+                     or seti.get("last_setup_error")
+                     or pi.get("last_payment_error"))
+        diag = {
+            "state": state,
+            "payment_object_status": pm_status,
+            "has_next_action": bool(confirm_data.get("next_action")),
+            "has_setup_intent": bool(seti),
+            "has_payment_intent": bool(pi),
+            "setup_intent_status": seti.get("status") if seti else None,
+            "payment_intent_status": pi.get("status") if pi else None,
+            "error": err_block,
+            "top_keys": list(confirm_data.keys())[:20],
+        }
+        _log(f"      ⚠️ confirm 无 redirect URL — 诊断: {json.dumps(diag, ensure_ascii=False)[:500]}")
+        # Also log the full response body (first 1200 chars) so we can see
+        # the actual Stripe response shape
+        body_snippet = json.dumps(confirm_data, ensure_ascii=False)[:1200]
+        _log(f"      confirm body: {body_snippet}")
 
     return confirm_data
 

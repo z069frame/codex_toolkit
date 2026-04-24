@@ -1428,6 +1428,18 @@ function onPayPayPalToggle() {
   const chk = document.getElementById('pay-paypal');
   const locGroup = document.getElementById('pay-paypal-loc-group');
   if (locGroup) locGroup.style.display = chk.checked ? '' : 'none';
+  // When PayPal is checked, force UI mode to Redirect — the chatgpt.com
+  // Custom URL requires a logged-in browser to open, which defeats the
+  // point of handing off the link. Redirect mode returns a standalone
+  // pay.openai.com URL that works anywhere.
+  if (chk.checked) {
+    const ui = document.getElementById('pay-ui-mode');
+    if (ui && ui.value !== 'redirect') {
+      ui.value = 'redirect';
+      const lblBar = document.getElementById('pay-bulk-status');
+      // (no bulk bar yet at generation time; just silently switch)
+    }
+  }
 }
 
 function _escHTML(s) {
