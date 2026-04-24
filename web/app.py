@@ -316,13 +316,14 @@ class OAuthMultiReq(BaseModel):
 
 class PayReq(BaseModel):
     email: Optional[str] = None
-    country: str = "US"
+    country: str = "US"           # Stripe Checkout session country (DE = PayPal available)
     count: int = 1
     proxy: Optional[str] = None
-    plan: str = "team"          # "team" | "plus"
-    ui_mode: str = "custom"     # "custom" (new) | "redirect" (old)
-    seat_quantity: int = 5      # team only
-    paypal_submit: bool = False # if True + country=DE → auto-submit via PayPal service
+    plan: str = "team"            # "team" | "plus"
+    ui_mode: str = "custom"       # "custom" (new) | "redirect" (old)
+    seat_quantity: int = 5        # team only
+    paypal_submit: bool = False   # auto-submit via PayPal (requires country=DE)
+    paypal_locale: str = "US"     # billing_details.country for Stripe PayPal submit (US/SG/DE/AU); should match server IP geo
 
 
 class PayPalSubmitReq(BaseModel):
@@ -2103,11 +2104,15 @@ async def api_pay(req: PayReq):
                 if tc != "team" and c.get("id"):
                     dm.patch_account(c["id"], {"token_context": "unknown"})
 
-    # Auto-submit via PayPal. Supported checkout-side countries (must have a
-    # matching billing profile + locale in core.pay_paypal):
-    _PAYPAL_OK_COUNTRIES = {"US", "SG", "DE", "AU"}
+    # PayPal auto-submit only valid when pay-link country=DE (otherwise
+    # Stripe Checkout doesn't offer PayPal). The billing locale for the
+    # Stripe submission is INDEPENDENT (normally US/SG to match Railway IP).
     country_uc = req.country.upper()
-    paypal_do = req.paypal_submit and country_uc in _PAYPAL_OK_COUNTRIES
+    pp_locale = (req.paypal_locale or "US").upper()
+    _PP_LOCALES_OK = {"US", "SG", "DE", "AU"}
+    paypal_do = (req.paypal_submit
+                 and country_uc == "DE"
+                 and pp_locale in _PP_LOCALES_OK)
 
     results = []
     for acc in accounts:
@@ -2118,7 +2123,6 @@ async def api_pay(req: PayReq):
         email = acc.get("email", "?")
         if r.get("ok"):
             link = r["payment_link"]
-            # Only persist the link for team plan (plus is one-off, no seats).
             if acc.get("id") and req.plan == "team":
                 dm.patch_account(acc["id"], {"payment_link": link,
                                              "subscription_status": "pending_payment"})
@@ -2126,17 +2130,16 @@ async def api_pay(req: PayReq):
                    "workspace": r.get("workspace_name"),
                    "plan": r.get("plan"), "ui_mode": r.get("ui_mode")}
 
-            # Kick off inline PayPal submission with the SAME country used
-            # on the checkout side — locale + billing profile must match or
-            # Stripe rejects the address update.
+            # PayPal submission uses the independent billing locale
+            # (country must match server IP geo for Stripe Radar happiness).
             if paypal_do:
                 pp_task_id = _create_task("pay-paypal", {
                     "email": email, "checkout_url": link,
-                    "locale": country_uc,
+                    "locale": pp_locale,
                 })
                 threading.Thread(
                     target=_run_paypal_submit,
-                    args=(pp_task_id, link, email, country_uc),
+                    args=(pp_task_id, link, email, pp_locale),
                     daemon=True,
                 ).start()
                 row["paypal_task_id"] = pp_task_id
@@ -2146,7 +2149,7 @@ async def api_pay(req: PayReq):
     return {
         "results": results,
         "paypal_enabled": paypal_do,
-        "paypal_locale": country_uc if paypal_do else None,
+        "paypal_locale": pp_locale if paypal_do else None,
     }
 
 

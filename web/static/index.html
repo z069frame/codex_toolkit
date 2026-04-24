@@ -801,13 +801,13 @@
       <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:12px">
         Generate ChatGPT checkout link. Leave email blank to auto-pick an unsubscribed account with valid AT.
         Use <b>Redirect (old)</b> for standalone Stripe URLs (no login needed).
-        Check <b>🅿️ PayPal submit</b> (US / SG / DE / AU) — the server runs the Stripe Checkout flow and returns a PayPal authorization URL; you open that URL manually to log in + approve.
       </p>
       <p style="color:var(--text-dim); font-size:0.8rem; margin-bottom:12px; padding:6px 10px; background:var(--bg); border-left:3px solid var(--primary); border-radius:4px">
-        💡 <b>US is the recommended locale</b> (most Stripe-friendly). SG / DE / AU also supported with matching billing profiles.
-        New/old URL use the same submission logic. PayPal submit goes <b>DIRECT by default</b> — ProxySeller (residential) is blocked by Stripe Radar, so the backend uses Railway's own IP for api.stripe.com calls.
-        The PayPal auth page is opened in your own browser, not proxied.
-        Override proxy for PayPal only via env var: <code>PAYPAL_PROXY=http://...</code>.
+        💡 <b>PayPal submit requires Country = DE</b> (Stripe only offers PayPal to DE sessions — other countries get card-binding only).
+        The <b>PayPal billing locale</b> is independent — best to match the server's outbound IP (US for Railway). Mismatched billing often triggers Stripe Radar.
+        Default: generate pay-link with <code>Country=DE</code>, then PayPal submit with <code>billing=US</code>.
+        PayPal HTTP calls go <b>DIRECT</b> (no proxy) — ProxySeller is blocked by Stripe.
+        The PayPal auth URL is opened in <b>your own browser</b> manually (no cookies/automation).
       </p>
       <div class="form-row">
         <div class="form-group"><label>Plan</label>
@@ -838,8 +838,17 @@
         <div class="form-group" id="pay-seats-group"><label>Seats (team)</label><input type="number" id="pay-seats" value="5" min="2" max="50"></div>
         <div class="form-group"><label>Count</label><input type="number" id="pay-count" value="1" min="1" max="20"></div>
         <div class="form-group" style="flex-direction:row; align-items:center; gap:6px; padding-bottom:2px">
-          <input type="checkbox" id="pay-paypal" disabled>
-          <label for="pay-paypal" id="pay-paypal-lbl" style="cursor:pointer; color:var(--text-dim)" title="Only available for country=DE">🅿️ PayPal submit</label>
+          <input type="checkbox" id="pay-paypal" disabled onchange="onPayPayPalToggle()">
+          <label for="pay-paypal" id="pay-paypal-lbl" style="cursor:pointer; color:var(--text-dim)" title="Only available when Country=DE (Stripe only offers PayPal to DE sessions)">🅿️ PayPal submit</label>
+        </div>
+        <div class="form-group" id="pay-paypal-loc-group" style="display:none">
+          <label>PayPal billing</label>
+          <select id="pay-paypal-locale" title="Stripe billing_details.country for the PayPal submission. Should match the server's IP geo — US recommended (Railway is US-east).">
+            <option value="US">US (matches Railway IP ✓)</option>
+            <option value="SG">SG</option>
+            <option value="DE">DE</option>
+            <option value="AU">AU</option>
+          </select>
         </div>
         <button class="btn btn-primary" onclick="doPay()">Generate</button>
       </div>
@@ -1392,22 +1401,31 @@ function onPayPlanChange() {
   if (seatsGroup) seatsGroup.style.display = (plan === 'team') ? '' : 'none';
 }
 
-const _PAYPAL_COUNTRIES = new Set(['US', 'SG', 'DE', 'AU']);
-
+// PayPal is only offered by Stripe when the Checkout session country=DE.
+// Other countries (US/SG/GB/JP/FR) only get card-binding, no PayPal option.
 function onPayCountryChange() {
   const c = document.getElementById('pay-country').value;
   const chk = document.getElementById('pay-paypal');
   const lbl = document.getElementById('pay-paypal-lbl');
-  if (_PAYPAL_COUNTRIES.has(c)) {
+  const locGroup = document.getElementById('pay-paypal-loc-group');
+  if (c === 'DE') {
     chk.disabled = false;
     lbl.style.color = 'var(--text)';
-    lbl.title = `Auto-submit via PayPal using ${c} billing profile (US suggested — Stripe-friendliest)`;
+    lbl.title = 'Auto-submit through PayPal. Billing locale is set below (should match server IP geo).';
   } else {
     chk.disabled = true;
     chk.checked = false;
     lbl.style.color = 'var(--text-dim)';
-    lbl.title = 'Available for US / SG / DE / AU only (each needs a matching billing profile)';
+    lbl.title = 'PayPal only offered when Country=DE. Other countries only allow card-binding.';
   }
+  // Show/hide billing locale picker based on checkbox state
+  if (locGroup) locGroup.style.display = chk.checked ? '' : 'none';
+}
+
+function onPayPayPalToggle() {
+  const chk = document.getElementById('pay-paypal');
+  const locGroup = document.getElementById('pay-paypal-loc-group');
+  if (locGroup) locGroup.style.display = chk.checked ? '' : 'none';
 }
 
 function _escHTML(s) {
@@ -1454,6 +1472,7 @@ async function doPay() {
   const ui_mode = document.getElementById('pay-ui-mode').value;
   const seat_quantity = parseInt(document.getElementById('pay-seats').value) || 5;
   const paypal_submit = document.getElementById('pay-paypal').checked;
+  const paypal_locale = document.getElementById('pay-paypal-locale').value;
   const box = document.getElementById('pay-result-box');
   const card = document.getElementById('pay-result');
   const countBadge = document.getElementById('pay-result-count');
@@ -1465,7 +1484,7 @@ async function doPay() {
   try {
     const r = await fetch(API + '/api/pay', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({email, country, count, plan, ui_mode, seat_quantity, paypal_submit}),
+      body: JSON.stringify({email, country, count, plan, ui_mode, seat_quantity, paypal_submit, paypal_locale}),
     });
     const data = await r.json();
     if (!r.ok) { box.innerHTML = '<span class="err">Error: ' + _escHTML(JSON.stringify(data)) + '</span>'; return; }
@@ -1568,13 +1587,11 @@ async function bulkSubscribe() {
   } catch(e) { s.textContent = 'Failed: ' + e.message; }
 }
 
-// Use the country selected at generation time as the PayPal locale.
-// If the user switched the dropdown since, the current value is fine — the
-// billing profile just needs to match *something* PayPal accepts; but US is
-// the most Stripe-friendly default.
+// PayPal billing locale for per-row / bulk buttons. Independent from
+// the pay-link country — should match Railway's outbound IP geo (US).
 function _currentPayPalLocale() {
-  const c = document.getElementById('pay-country').value;
-  return _PAYPAL_COUNTRIES.has(c) ? c : 'US';
+  const sel = document.getElementById('pay-paypal-locale');
+  return (sel && sel.value) || 'US';
 }
 
 async function payPalOne(idx) {
